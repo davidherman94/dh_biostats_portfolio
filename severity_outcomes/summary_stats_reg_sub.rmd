@@ -1,0 +1,3419 @@
+---
+title: "title"
+author: "David Herman"
+date: [REDACTED]
+output:
+  html_document:
+    embed-resources: true
+    toc-location: right
+    df_print: paged
+    theme: united
+    highlight: tango
+    toc: true
+    toc_depth: 4
+    number-sections: true
+    code_folding: hide
+    fig_caption: true
+    fig_width: 7
+    fig_height: 5
+    keep_md: true
+    css: styles.css
+editor: visual
+cap-location: margin
+---
+
+```{r setup, echo = F}
+knitr::opts_chunk$set(echo = F, warning = F, message = F) 
+```
+
+```{r Import & load data/packages/functions, message=FALSE, warning=FALSE, include=FALSE}
+rm(list=ls())
+
+source("../src/config.R")
+source("../src/functions.R")
+
+# Load libraries -------------------------------------------------------
+load_libraries(PACKAGES)
+
+# Client Authentification ----------------------------------------------
+# do not displayed
+```
+
+#### Patient's distribution during follow-up
+
+```{r obtain the number of patients/IDs under follow-up by sex}
+# df of interest with follow up days, patient uuid and sex variables
+sex_follow_up <- rare_disease_followup_durations_days %>%
+  left_join(rare_disease_demographics_new, by = "patient_uuid")
+
+# Extract the unique patient_uuid under follow up by age group and sex
+follow_up_patients_uuid <- sex_follow_up %>%
+  
+  group_by(patient_uuid, sex) %>%
+  
+  reframe(age_range = seq(floor(first_record_age_days/365.25),
+                      floor(last_record_age_days/365.25))) %>%
+  
+  mutate(annual_age_groups = cut( 
+    age_range,
+    breaks = c(0:12, Inf),
+    right = F, 
+    include.lowest = T)) %>%
+
+  filter(age_range < 12) %>%
+  
+  dplyr::select(-age_range)
+
+
+# Count the number of patients under follow by group of age and sex
+summary_count_uuid <- follow_up_patients_uuid %>%
+  
+  group_by(sex, annual_age_groups) %>%
+  
+  reframe(n = n_distinct(patient_uuid)) %>%
+  
+  bind_rows(
+    follow_up_patients_uuid %>%
+      
+      group_by(annual_age_groups) %>%
+      
+      reframe(n = n_distinct(patient_uuid)) %>%
+      
+      mutate(sex = 'patients')
+  ) %>%
+  
+  pivot_wider(values_from = n, names_from = sex) %>%
+  
+  mutate(
+    percent_total = (patients / first(patients)) * 100,  # Percentage of total follow-up by age group
+    percent_male = (male / patients) * 100,  # Percentage of total patients that are male
+    percent_female = (female / patients) * 100  # Percentage of total patients that are female
+  )
+
+# Transpose data
+summary_transposed <- summary_count_uuid %>%
+  
+  pivot_longer(cols = c(patients, male, female), names_to = 'Category') %>%
+  
+  pivot_wider(values_from = value, names_from = annual_age_groups)
+
+# Display the summary table
+summary_transposed %>%
+  kable(
+    caption = "Table 1. Summary of total number of patients under follow-up for each group of age based on first and last linked medical record in the RWD Health Rare Disorders Databank",
+    align = "c",
+    format = "html"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = F,
+    position = "center"
+  ) %>%
+  column_spec(1, bold = TRUE, background = "#f2f2f2")
+
+summary_transposed %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/summary_patients_table.csv")
+```
+
+```{r plot of patient under follow with reasons for loss, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE, dpi=300}
+# Identify deceased patients
+deceased_patients <- rare_disease_primary_diagnosis %>% 
+  filter(primary_diagnosis == "Deceased") %>% 
+  pull(patient_uuid)
+
+# Prepare the follow-up data
+follow_up_plot_data <- rare_disease_followup_durations_days %>%
+  distinct(patient_uuid, first_record_age_days, last_record_age_days) %>%
+  ungroup() %>%
+  mutate(first_record_age_years = first_record_age_days / 365.25,
+         last_record_age_years = last_record_age_days / 365.25,
+         followup_duration = last_record_age_years - first_record_age_years,
+         last_record_age_years_plot = pmin(last_record_age_years, 12),
+         censored = last_record_age_years > 12,
+         loss_reason = case_when(
+           patient_uuid %in% deceased_patients ~ "Death",
+           censored ~ "Age cut-off",
+           TRUE ~ "Lost to follow-up"
+         )) %>%
+  arrange(desc(followup_duration)) %>%  # Ordering by descending follow-up duration
+  mutate(patient_label = factor(row_number(), levels = rev(row_number()))) %>%  # Assign rank explicitly
+  dplyr::select(-first_record_age_days, -last_record_age_days)
+
+# Define colors for loss to follow-up reasons
+colors_ltfu <- c("Death" = "red", "Lost to follow-up" = "black", "Age cut-off" = "blue")
+
+# Create ggplot
+follow_up_plot <- ggplot(follow_up_plot_data) +
+  # Mark end of follow-up
+  geom_point(aes(x = last_record_age_years_plot,
+                 y = patient_label,
+                 color = loss_reason),
+             shape = 18,
+             size = 2.5) +  
+  # Add dashed follow-up lines
+  geom_linerange(aes(y = patient_label, 
+                     xmin = first_record_age_years,
+                     xmax = last_record_age_years_plot),
+                 size = .4,
+                 linetype = "dashed",
+                 colour = "black") +
+  # Add vertical lines for patients at the beggining of follow-up
+  geom_segment(aes(x = first_record_age_years, xend = first_record_age_years, 
+                   y = as.numeric(patient_label) - 0.3, 
+                   yend = as.numeric(patient_label) + 0.3),
+               size = 0.5, color = "black") +
+  geom_vline(xintercept = 12, linetype = "dashed", color = "black", size = 0.4) +
+  # Add text annotation above the line
+  # annotate("text", x = 11.5, y = max(as.numeric(follow_up_plot_data$patient_label)) - 2, 
+  #          label = "End of Study", color = "black", size = 2, fontface = "bold", vjust = 50, hjust = .7) +
+  # Custom colors for legend
+  scale_color_manual(name = "Follow-Up Status", values = colors_ltfu) +
+  # Adjust x-axis
+  scale_x_continuous(breaks = seq(0, 12, 1), limits = c(0, 12)) +
+  labs(x = "Patient age (in years)", y = "Patient number") +
+  # Clean theme and formatting
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(), 
+    panel.background = element_rect(fill = "white", color = NA), 
+    axis.text.x = element_text(size = 7),
+    axis.text.y = element_text(size = 7, face = "bold", margin = margin(r = -18)),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 8),
+    legend.title = element_text(size = 9),
+    legend.position = "bottom",
+    legend.text = element_text(size = 9)
+  )
+
+follow_up_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/follow_up_plot.png", 
+       follow_up_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+#### Seizure history
+
+```{r Seizure frequency derivation, echo=TRUE, message=FALSE, warning=FALSE}
+seizure_subgrouping <-
+  
+  # starting from processed seizure dataset
+  rare_disease_seizure_EEG_processed %>%
+  
+  # select variables of interest
+  dplyr::select(patient_uuid,
+                seizure_history_age_days,
+                seizure_history_value_perday_aggr) %>%
+
+  mutate( 
+    
+    # create variable to obtain the patients with at least one record of seizure per each group of age
+    seizure_record = "Yes",
+    
+    age_seizure = seizure_history_age_days / 365.25,
+    
+    # Derivation of age at seizure in 1-year intervals
+    annual_age_groups = cut(
+      age_seizure,
+      breaks = c(0:12, Inf),
+      right = F,
+      include.lowest = T)
+  )  %>%
+  
+  # keep only records of age of interest and 0-2 years old
+  filter(age_seizure < 12) %>%
+  
+  # Select relevant columns
+  dplyr::select(
+    patient_uuid,
+    age_seizure,
+    seizure_history_age_days,
+    annual_age_groups,
+    seizure_history_value_perday_aggr,
+    seizure_record
+  )
+
+
+# Adding rows with patients under follow up without seizure per day records during a specific year of life
+seizure_subgrouping <- follow_up_patients_uuid %>%
+  
+  left_join(seizure_subgrouping,
+            by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  # assuming that the patient has been under follow up during the entire year if had a record for the specific age group
+  mutate(
+    seizure_record = replace_na(seizure_record, "No")) %>%
+  
+  arrange(patient_uuid, seizure_history_age_days)
+```
+
+##### Seizure frequency
+
+```{r violin plot of seizure frequencies, fig.align='center', message=FALSE, warning=FALSE, dpi=300, include=FALSE}
+# Seizure frequency plot
+seizure_violin_plot <- ggplot(seizure_subgrouping, aes(x = annual_age_groups, y = seizure_history_value_perday_aggr)) +
+  
+  geom_violin(trim = TRUE, scale = "count", width = 0.9) +
+  
+  geom_boxplot(width = 0.4, fill = "white") +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Seizures frequency per day all patient records",
+    fill = "Age group"
+  ) +
+  
+  scale_fill_manual(values = c(
+    "(0-2]" = "blue", 
+    "(2-12]" = "green")) +
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 750, 100), limits = c(0, 750)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+seizure_violin_plot
+```
+
+```{r summary of seizure frequencies, echo=TRUE, fig.align='center', message=FALSE, warning=FALSE}
+# calculate the intra patient mean to reduce variability
+seizure_summary_per_patient <- seizure_subgrouping %>%
+  
+  group_by(patient_uuid, annual_age_groups) %>%
+  
+  # intra-patient mean and median seizure freq. for each group of age
+  summarise(
+    mean_seizures_per_day_patient =
+      mean(seizure_history_value_perday_aggr, na.rm = TRUE),
+    median_seizures_per_day_patient =
+      median(seizure_history_value_perday_aggr, na.rm = TRUE),
+    .groups = "drop"
+  )
+  
+seizure_summary_age_group <- seizure_summary_per_patient %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  # mean, median and dispersion (deviation and range-based measures) metrics for each group of age
+  summarise(
+    mean_seizures_per_day = round(
+      mean(mean_seizures_per_day_patient, na.rm = TRUE), 1),
+    sd_seizures_per_day = round(
+      sd(mean_seizures_per_day_patient, na.rm = TRUE), 1),
+    median_seizures_per_day = round(
+      median(median_seizures_per_day_patient, na.rm = TRUE), 1),
+    seizures_per_day_p25 = round(
+      quantile(median_seizures_per_day_patient, 0.25, na.rm = TRUE), 1),
+    seizures_per_day_p75 = round(
+      quantile(median_seizures_per_day_patient, 0.75, na.rm = TRUE), 1),
+    patients = n_distinct(patient_uuid),
+    .groups = "drop"
+  ) %>%
+  
+  arrange(annual_age_groups)
+```
+
+```{r violin plot seizures per patient summary table, message=FALSE, warning=FALSE, dpi=300, include=FALSE}
+seizure_violin_plot_per_patient <- ggplot(seizure_summary_per_patient, aes(x = annual_age_groups, y =  median_seizures_per_day_patient)) +
+  
+  geom_violin(trim = TRUE, scale = "count", width = 0.9) +
+  
+  geom_boxplot(width = 0.4, fill = "white") +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Seizures frequency per day per patient",
+    fill = "Age group"
+  ) +
+  
+  scale_fill_manual(values = c(
+    "(0-2]" = "blue", 
+    "(2-12]" = "green")) +
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 400, 100), limits = c(0, 400)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+seizure_violin_plot_per_patient
+```
+
+```{r seizure summary table, echo=TRUE, message=FALSE, warning=FALSE}
+# transpose the table
+seizure_summary_t <- seizure_summary_age_group %>%
+  
+  mutate(
+    mean_sd = paste0(mean_seizures_per_day, " (", sd_seizures_per_day, ")"),
+    median_Q1_Q3 = paste0(median_seizures_per_day, " [", seizures_per_day_p25, "-", seizures_per_day_p75, "]")
+  ) %>%
+  
+  dplyr::select(annual_age_groups, mean_sd, median_Q1_Q3, patients) %>%
+    rename( 
+    `Mean (sd)` = mean_sd,
+    `Median [Q1-Q3]` = median_Q1_Q3,
+    `Patients (N)` = patients
+  ) %>%
+  
+  mutate(across(everything(), as.character)) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+# seizure summary table
+kable(seizure_summary_t, format = "html", caption = "Table 2. Summary of seizures per day during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") %>%
+  footnote(
+    general = "Age groups defined by patient's age at seizure event.",
+    general_title = "**",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "For metric calculation, it was obtained first the mean/median for each patient and then, the mean/median across all patients in each group of age.",
+    general_title = "*",
+    footnote_as_chunk = TRUE)
+
+seizure_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/seizure_summary_table.csv")
+```
+
+```{r Mean of seizures per day chart, echo=TRUE, fig.align='center', message=FALSE, warning=FALSE, dpi=300}
+seizure_meanplot <- ggplot(seizure_summary_age_group, aes(x = annual_age_groups, y = mean_seizures_per_day, fill = case_when(
+      annual_age_groups %in% c("[0,1)", "[1,2)") ~ "(0-2]", TRUE ~ "(2-12]"
+    ))) +
+  
+  geom_col(position = "dodge", width = 0.6) + 
+  
+  # geom_text(aes(label = paste0("N = ", patients)), vjust = -0.5, size = 2.8) +  # Show patient count on bars
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Mean of seizures per day",
+    fill = "Age group"
+  ) +
+
+  scale_fill_manual(values = c(
+    "(0-2]" = "grey", 
+    "(2-12]" = "black")) + 
+
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 45, 5), limits = c(0, 45)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+seizure_meanplot
+
+# Save the plot as a PNG file
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/Seizure_mean_plot.png",
+       seizure_meanplot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+```{r median_seizure_per_day_chart, echo=TRUE, fig.align='center', message=FALSE, warning=FALSE, dpi=300}
+# Seizure median plot
+seizure_medianplot <- ggplot(seizure_summary_age_group, aes(x = annual_age_groups, y = median_seizures_per_day, fill = case_when(
+      annual_age_groups %in% c("[0,1)", "[1,2)") ~ "(0-2]",
+      TRUE ~ "(2-12]"
+    ))) +
+  
+  geom_col(position = "dodge", width = 0.6) + 
+  
+  # geom_text(aes(label = paste0("N = ", patients)), vjust = -0.5, size = 2.8) +  # Show patient count on bars
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Median of seizures per day",
+    fill = "Age group"
+  ) +
+
+  scale_fill_manual(values = c(
+    "(0-2]" = "grey", 
+    "(2-12]" = "black")) + 
+
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 13, 1), limits = c(0, 13.5)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+seizure_medianplot
+
+# save as png graph
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/Seizure_median_plot.png", 
+       seizure_medianplot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+#### Hospital admissions
+
+```{r admission derivation, echo=TRUE, message=FALSE, warning=FALSE}
+## Hospitalizations ---------------------------------------
+admissions_subgrouping <- rare_disease_hospital_admission %>%
+  
+  # Select relevant columns
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    admission_diagnosis
+  ) %>%
+  
+  # Filter out birth-related and planned admissions
+  filter(!str_detect(admission_diagnosis, "birth|Birth|planned|Planned")) %>%
+  
+  # Derivation of admission day during follow-up
+  mutate(
+    
+    # record of hospital admission
+    hosp_admission = "Yes",
+    
+    # Derivation of follow-up duration
+    length_of_stay_days = (admission_age_days_lastDate - admission_age_days_firstDate) + 1,
+
+    # Derivation of age at admission
+    age_admission = admission_age_days_firstDate / 365.25,
+
+    # Derivation of age at seizure in suggested sub grouping
+    annual_age_groups = cut(
+      age_admission,
+      breaks = c(0:12, Inf),
+      right = F,
+      include.lowest = T),
+    
+    # Determine type of admission diagnosis based on seizures/epilepsy
+    admission_diagnosis_rec = factor(
+      ifelse(
+        str_detect(
+          tolower(admission_diagnosis), 
+          paste(tolower(SEIZURE.EVENT), collapse = "|")
+        ),
+        "seizure_event",
+        "non_seizure_event"
+      ),
+      levels = c("non_seizure_event", "seizure_event"),
+      labels = c("Non-seizure-related", "Seizure-related")
+    )
+  ) %>%
+  
+  # Filter out records outside the age range
+  filter(age_admission < 12) %>%
+  
+  # remove duplicated
+  distinct(patient_uuid,
+           admission_age_days_firstDate,
+           admission_age_days_lastDate, 
+           admission_diagnosis,
+           .keep_all = TRUE) %>%
+  
+  # Sort by patient and the first day of hospitalization
+  arrange(patient_uuid, admission_age_days_lastDate)
+
+
+# adding rows with patients under risk but without admissions at the specific age group
+admissions_subgrouping_complete <- follow_up_patients_uuid %>%
+  
+  left_join(admissions_subgrouping, by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  mutate(
+    hosp_admission = replace_na(hosp_admission, "No")
+  ) %>%
+  
+  arrange(patient_uuid, annual_age_groups)
+```
+
+##### Total hospital admissions
+
+```{r summary of admissions events by age group, echo=FALSE, message=FALSE, warning=FALSE}
+# summary of total admissions events by age group
+admissions_summary_per_patient <- admissions_subgrouping_complete %>%
+  
+  group_by(patient_uuid, annual_age_groups) %>%
+  
+  # count of hospitalizations per patient for each year of life
+  summarise(
+    admission_count_per_patient = sum(hosp_admission == "Yes"),
+    .groups = 'drop'
+  )
+
+admissions_summary_age_group <- admissions_summary_per_patient %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  # summary of hospitalizations across patients by age group
+  summarise(
+    # Total number of admissions events
+    admission_count = round(sum(admission_count_per_patient), 1),
+    # Mean admissions per patient
+    mean_admission_per_patient = round(mean(admission_count_per_patient), 1),
+    # Standard deviation of admissions per patient
+    sd_admission_per_patient = round(sd(admission_count_per_patient), 1),
+    # Median admissions per patient
+    median_admission_per_patient = round(median(admission_count_per_patient), 1),
+    # 25th percentile (Q1)
+    p25_admission_per_patient = round(quantile(admission_count_per_patient, 0.25), 1),
+    # 75th percentile (Q3)
+    p75_admission_per_patient = round(quantile(admission_count_per_patient, 0.75), 1),
+    # Number of patients under follow-up
+    patients = n_distinct(patient_uuid),
+    .groups = 'drop'
+  ) %>%
+  
+  mutate(
+    # Percentage of hospital admissions from total admissions
+    admission_percentage = round((admission_count / sum(admission_count)) * 100, 1),
+  ) %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r violin plot of hospital admissions, fig.align='center', message=FALSE, warning=FALSE, dpi=300, include=FALSE}
+# Hospital admissions plot
+admission_violin_plot <- ggplot(admissions_summary_per_patient, aes(x = annual_age_groups, y = admission_count_per_patient)) +
+  
+  geom_violin(trim = TRUE, scale = "count", width = 0.9) +
+  
+  geom_boxplot(width = 0.4, fill = "white") +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Distribution of the count of hospital admissions per patient"
+  ) +
+
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 15, 1), limits = c(0, 15)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+admission_violin_plot
+```
+
+```{r summary table for hospital admissions, echo=FALSE, message=FALSE, warning=FALSE}
+# transpose table
+admissions_summary_t <- admissions_summary_age_group %>%
+  
+  mutate(
+    `n (%)` = paste0(admission_count, " (", admission_percentage, ")"),
+    `Mean (sd)` = paste0(mean_admission_per_patient, " (", sd_admission_per_patient, ")"),
+    `Median [Q1-Q3]` = paste0(median_admission_per_patient, " [", p25_admission_per_patient, "-", p75_admission_per_patient, "]")
+  ) %>%
+  
+  dplyr::select(annual_age_groups,
+                `n (%)`,
+                `Mean (sd)`, 
+                `Median [Q1-Q3]`,
+                `Patients (N)` = patients) %>%
+  
+  mutate(across(everything(), as.character)) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+# summary table
+kable(admissions_summary_t, format = "html", caption = "Table 3. Summary of hospital admissions events during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") %>%
+  footnote(
+    general = "Age groups defined by patient's age at admission event.",
+    general_title = "**",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Birth and planned admissions are excluded.",
+    general_title = "*",
+    footnote_as_chunk = TRUE)
+
+admissions_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/admissions_summary_table.csv")
+```
+
+```{r admissions per patient plot, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE,  dpi = 300}
+# admission plot
+admission_plot <- ggplot(admissions_summary_age_group, aes(x = annual_age_groups, y =  median_admission_per_patient, fill = case_when(
+      annual_age_groups %in% 
+        c("[0,1)", "[1,2)") ~ "(0-2]",
+      TRUE ~ "(2-12]" ))) +
+  
+  geom_col(position = "dodge", width = 0.6) + 
+  
+  #geom_text(aes(label = paste0("N = ", patients)), vjust = -2, size = 2.2) +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Median number of admissions per patient",
+    fill = "Age group") +
+  
+  scale_fill_manual(values = c(
+    "(0-2]" = "grey", 
+    "(2-12]" = "black")) + 
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 4.5, 1), limits = c(0, 4.5)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+admission_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/Admissions_per_patient_plot.png", admission_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+```{r admissions per patient plot by admission diagnosis, echo=FALSE, message=FALSE, warning=FALSE}
+# Summary of admissions by diagnosis
+admissions_summary_diagnosis <- admissions_subgrouping %>%
+  
+  filter(!is.na(admission_diagnosis_rec)) %>%
+  
+  group_by(annual_age_groups, patient_uuid, admission_diagnosis_rec) %>%
+  
+  summarise(
+    admission_count_per_patient = sum(hosp_admission == "Yes", na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  
+  group_by(annual_age_groups, admission_diagnosis_rec) %>%
+  
+  summarise(
+    # Total admissions for each diagnosis and age group
+    admission_count = round(sum(admission_count_per_patient, na.rm = TRUE), 1),
+    # Median of admissions per patient
+    median_admission_per_patient = round(median(admission_count_per_patient, na.rm = TRUE), 1),
+    # Mean of admissions per patient
+    mean_admission_per_patient = round(mean(admission_count_per_patient, na.rm = TRUE), 1),
+    # Standard deviation
+    sd_admission_per_patient = round(sd(admission_count_per_patient, na.rm = TRUE), 1),
+    # 25th percentile (Q1)
+    p25_admission_per_patient = round(quantile(admission_count_per_patient, 0.25, na.rm = TRUE), 1),
+    # 75th percentile (Q3)
+    p75_admission_per_patient = round(quantile(admission_count_per_patient, 0.75, na.rm = TRUE), 1),
+    patients = n_distinct(patient_uuid),
+    .groups = 'drop'
+  ) %>%
+  
+  arrange(annual_age_groups)
+```
+
+```{r admissions by diagnosis, fig.align='center', echo=TRUE, message=FALSE, warning=FALSE, dpi= 300}
+admission_plot_diag <- ggplot() +
+  
+  # Bar plot for "Seizure-related" and "Non-seizure-related" admissions
+  geom_col(
+    data = admissions_summary_diagnosis, 
+    aes(x = annual_age_groups, y = mean_admission_per_patient, fill = admission_diagnosis_rec), 
+    position = "dodge", width = 0.6
+  ) +
+  
+  # Customize labels
+  labs(
+    x = "Age Group (in years)",
+    y = "Mean number of admissions per patient",
+    fill = "Admission Diagnosis*"
+  ) +
+  
+  # Custom colors
+  scale_fill_manual(
+    values = c(
+      "Seizure-related" = "blue",
+      "Non-seizure-related" = "red"
+    )
+  ) +
+  
+  # Minimal theme
+  theme_minimal() +
+  
+  # Adjust y-axis scale
+  scale_y_continuous(breaks = seq(0, 4, 1), limits = c(0, 4.5)) +
+  
+  # Customize text size and legend
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+admission_plot_diag
+
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/Admissions_diag_per_patient_plot.png", admission_plot_diag, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+##### Length of Stay (LOS)
+
+```{r summary of length of stay by age group, echo=TRUE, message=FALSE, warning=FALSE}
+los_summary <- admissions_subgrouping_complete %>%
+  
+  group_by(patient_uuid, annual_age_groups) %>%
+  
+  # intra-patient mean and median LOS for each group of age
+  summarise(
+    los_mean_patient = mean(length_of_stay_days, na.rm = TRUE),
+    los_median_patient =  median(length_of_stay_days, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  # mean, median and dispersion (deviation and range-based measures) metrics for each group of age
+  summarise(
+    los_mean = round(mean(los_mean_patient, na.rm = TRUE), 1),
+    los_sd = round(sd(los_mean_patient, na.rm = TRUE), 1),
+    los_median = round(median(los_median_patient, na.rm = TRUE), 1),
+    los_p25 = round(quantile(los_median_patient, 0.25, na.rm = TRUE), 1),
+    los_p75 = round(quantile(los_median_patient, 0.75, na.rm = TRUE), 1),
+    patients = n_distinct(patient_uuid),
+    .groups = "drop"
+  ) %>%
+  
+  arrange(annual_age_groups)
+```
+
+```{r summary table of LOS by age group, echo=TRUE, message=FALSE, warning=FALSE}
+# transpose table
+los_summary_t <- los_summary %>%
+  
+  mutate(
+    `Mean (sd)` = paste0(los_mean, 
+                         " (", 
+                         los_sd,
+                         ")"),
+    `Median [Q1-Q3]` = paste0(los_median,
+                              " [",
+                              los_p25,
+                              "-", 
+                              los_p75,
+                              "]")
+  ) %>%
+  
+  dplyr::select(
+    annual_age_groups,
+    `Mean (sd)`,
+    `Median [Q1-Q3]`, 
+    `Patients (N)` = patients) %>%
+  
+  mutate(across(everything(), as.character)) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+# summary table
+kable(los_summary_t, format = "html", caption = "Table 5. Summary of Length of Stay (LOS) during follow-up by age groups.") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") %>%
+  footnote(
+    general = "Age groups defined by patient's age at hospital admission",
+    general_title = "*",
+    footnote_as_chunk = TRUE)%>%
+  footnote(
+    general = "Birth and planned admissions are excluded.",
+    general_title = "**",
+    footnote_as_chunk = TRUE)
+
+los_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/los_summary_table.csv")
+```
+
+```{r LOS plot during follow-up, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE, dpi= 300}
+los_median_plot <- ggplot(los_summary, aes(x = annual_age_groups, y =  los_median, fill = case_when(
+      annual_age_groups %in% 
+        c("[0,1)", "[1,2)") ~ "(0-2]",
+      TRUE ~ "(2-12]" ))) +
+  
+  geom_col(position = "dodge", width = 0.6) + 
+  
+ # geom_text(aes(label = paste0("N = ", patients)), vjust = -3.5, size = 2.2) +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Length of Stay in days (Median)",
+    fill = "Age group"
+      ) +
+  
+  scale_fill_manual(values = c(
+    "(0-2]" = "grey", 
+    "(2-12]" = "black")) + 
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 7, 1), limits = c(0, 7)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+los_median_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/LOS_median_plot.png", 
+       los_median_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+```{r los by admission type, echo=TRUE, fig.align='center', message=FALSE, warning=FALSE, dpi= 300}
+los_summary_diagnosis_type <- admissions_subgrouping_complete %>%
+  
+  filter(!is.na(admission_diagnosis_rec)) %>%
+
+  group_by(patient_uuid, annual_age_groups, admission_diagnosis_rec) %>%
+  
+  # intra-patient mean and median LOS for each group of age
+  summarise(los_mean_patient = mean(length_of_stay_days, na.rm = TRUE),
+            los_median_patient = median(length_of_stay_days, na.rm = TRUE),
+              .groups = "drop") %>%
+  
+  ungroup() %>%
+  
+  group_by(annual_age_groups, admission_diagnosis_rec) %>%  
+  
+  # mean, median and dispersion (deviation and range-based measures) metrics for each group of age
+  summarise(los_mean = round(mean(los_mean_patient, na.rm = TRUE), 1),
+            los_sd = round(sd(los_mean_patient, na.rm = TRUE), 1),
+            los_median = round(median(los_median_patient, na.rm = TRUE), 1),
+            los_p25 = round(quantile(los_median_patient, 0.25, na.rm = TRUE), 1),
+            los_p75 = round(quantile(los_median_patient, 0.75, na.rm = TRUE), 1),
+            .groups = "drop") %>%
+  
+  # join with max number of unique patients under follow up
+  left_join(dplyr::select(
+    summary_count_uuid, annual_age_groups, patients), by = "annual_age_groups") 
+```
+
+```{r los plot by admission type, echo=TRUE, fig.align='center', dpi= 300}
+los_plot_diag <- ggplot() +
+  
+  # Bar plot for "Seizure-related" and "Non-seizure-related" admissions
+  geom_col(
+    data = los_summary_diagnosis_type, 
+    aes(x = annual_age_groups, y = los_median, fill = admission_diagnosis_rec), 
+    position = "dodge", width = 0.6
+  ) +
+  
+  # Customize the labels and appearance
+  labs(
+    x = "Age Group (in years)",
+    y = "Median of length of stay per patient by type of admission diagnosis",
+    fill = "Admission diagnosis*"
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Seizure-related" = "blue",
+      "Non-seizure-related" = "red"
+    )
+  ) +
+  
+  # Minimal theme
+  theme_minimal() +
+  
+  # Adjust y-axis scale
+  scale_y_continuous(breaks = seq(0, 6, 1), limits = c(0, 6)) +
+  
+  # Customize text size and legend
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+los_plot_diag
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/LOS_median_plot.by.diagnosis.png", 
+       los_plot_diag, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+##### 30-day Unplanned Hospital Readmissions (30-day UHRs)
+
+```{r 30-day UHRs derivation, echo=TRUE, message=FALSE, warning=FALSE}
+# derivation of 30 day UHRs
+find_readmissions <- function(
+    data,              # Input dataset containing admission and discharge records
+    grouping,          # Grouping variable to identify unique patients or cohorts
+    start_date,        # Column name representing the admission start date
+    end_date,          # Column name representing the discharge date
+    window_days = 30){ # Time window in days to define readmission
+
+  comparison <- FALSE  # Flag to track whether the data has stabilized after iterations
+
+  while(!comparison){  # Iterate until no new groups are formed
+    if(!any(grepl('adm_group', names(data)))){  
+      data <- data %>%
+        mutate(adm_groups = 0)  # Initialize admission group column if it does not exist
+    }
+
+    prev_data <- data  # Store a copy of the previous iteration's data for comparison
+
+    data <- data %>%
+      arrange(!!sym(start_date)) %>%  # Sort the dataset by the admission start date
+      
+      group_by_at(c('adm_groups', grouping)) %>%  # Group by current admission groups and provided grouping variable
+      
+      mutate(within_window = !!sym(start_date) - first(!!sym(end_date)) <= window_days, 
+             # Compute whether the admission falls within the 30-day readmission window
+             adm_groups = cur_group_id() + cumsum(within_window != lag(within_window, default = first(within_window)))) %>%
+             # Assign new admission groups based on readmission criteria
+      
+      mutate(readmission = case_when(
+        row_number() == 1 ~ 'index',  # Mark the first admission in a group as the index admission
+        TRUE ~ glue::glue('30_days_uhr_{row_number()-1}')  # Label readmissions sequentially
+        )) %>%
+      
+      ungroup()  # Remove grouping to allow further processing
+
+    comparison <- identical(prev_data, data)  # Check if any changes were made; if not, stop iterating
+  }
+
+  return(data %>%
+           dplyr::select(-adm_groups, -within_window))  # Remove intermediate columns before returning the final dataset
+}
+
+# Run prior function to find 30-day UHRs
+readmissions_subgrouping <- find_readmissions(
+  data = admissions_subgrouping,
+  grouping = 'patient_uuid',
+  start_date = 'admission_age_days_firstDate',
+  end_date = 'admission_age_days_lastDate'
+  )
+
+
+# adding variable to validate only the first 30-day readmissions if many occurs in the same time 30-day windows after last index discharge day
+readmissions_subgrouping <- readmissions_subgrouping %>%
+  
+  arrange(patient_uuid, admission_age_days_firstDate, admission_age_days_lastDate) %>%
+  
+  group_by(patient_uuid) %>%
+  
+  mutate(
+    # Dynamically update last_index_discharge by keeping the most recent "index" discharge
+    last_index_discharge = if_else(readmission == "index", admission_age_days_lastDate, NA_real_),
+    
+    # Fill forward the last_index_discharge for the patient
+    last_index_discharge = zoo::na.locf(last_index_discharge, na.rm = FALSE),
+    
+    # Parse the numeric part of the readmission string for comparison
+    readmission_number = as.integer(str_extract(readmission, "\\d+")),
+    
+    # Calculate the time difference between last admission with the last index discharge
+    time_diff = admission_age_days_firstDate - last_index_discharge,
+    
+    # Determine if the current row is a valid readmission
+    valid_readmission = case_when(
+      # Mark index as index admission
+      readmission == "index" ~ 'Index',
+      
+      # Mark the first valid as always 30-day readmission
+      readmission == "30_days_uhr_1" ~ 'Yes',
+      
+      # check the distance between 2nd and further 30 UHRs in the sequence with the last index.
+      readmission_number == lag(readmission_number, default = NA) + 1 & time_diff > 30 ~ 'Yes',
+      
+      # All other cases are not valid readmissions
+      TRUE ~ 'No'
+    )
+  ) %>%
+  
+  ungroup() %>%
+  
+  dplyr::select(-readmission_number, -time_diff, -last_index_discharge)
+```
+
+```{r obtaining the number of patient under risk of 30-day UHRs (with at least one admission event at follow-up), message=FALSE, warning=FALSE, include=FALSE}
+# Merge follow-up and hospital admission data to calculate patient under risk
+hosp_admission_follow_up_risk <- sex_follow_up %>%
+  left_join(rare_disease_hospital_admission, by = "patient_uuid") %>%
+   # Keep only those with at least one admission
+  filter(!is.na(admission_age_days_firstDate))
+
+# Extract patients under risk of 30-day admission
+readmission_follow_patients_uuid <- hosp_admission_follow_up_risk %>%
+  
+  group_by(patient_uuid, sex) %>%
+  
+  summarise(first_admission_age_days = min(admission_age_days_firstDate, na.rm = TRUE), 
+            last_record_age_days = max(last_record_age_days, na.rm = TRUE)) %>%
+  
+  # Define age groups from first admission onwards
+  reframe(age_range = seq(floor(first_admission_age_days/365.25),
+                          floor(last_record_age_days/365.25))) %>%
+  
+  mutate(annual_age_groups = cut(
+    age_range,
+    breaks = c(0:12, Inf),
+    right = F,
+    include.lowest = T)) %>%
+  
+  filter(age_range < 12) %>%
+  
+  dplyr::select(-age_range)
+
+# adding rows with patients under risk but without readmissions at the specific age group
+readmissions_subgrouping <- readmission_follow_patients_uuid %>%
+  
+  left_join(readmissions_subgrouping, by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  mutate(
+    valid_readmission = replace_na(valid_readmission, "No")
+  ) %>%
+  
+  arrange(patient_uuid, annual_age_groups)
+```
+
+```{r summary of 30-day readmissions events by age group, echo=FALSE, message=FALSE, warning=FALSE}
+readmissions_summary <- readmissions_subgrouping %>%
+
+  group_by(patient_uuid, annual_age_groups) %>%  
+  
+  # count of readmissions per patient for each year of life
+  summarise(
+    readmission_count_per_patient = sum(valid_readmission == "Yes", na.rm = TRUE),
+    .groups = 'drop') %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  # summary of readmissions across patients by age group
+  summarise(
+    # Total number of readmissions
+    readmission_count = round(sum(readmission_count_per_patient), 1),  
+    # Mean of readmissions per patient
+    mean_readmission_per_patient = round(mean(readmission_count_per_patient), 1),  
+    # Standard deviation of readmissions per patient
+    sd_readmission_per_patient = round(sd(readmission_count_per_patient), 1), 
+    # Median of readmissions per patient
+    median_readmission_per_patient = round(median(readmission_count_per_patient), 1), 
+    # 25th percentile (Q1)
+    p25_readmission_per_patient = round(quantile(readmission_count_per_patient, 0.25), 1), 
+    # 75th percentile (Q3)
+    p75_readmission_per_patient = round(quantile(readmission_count_per_patient, 0.75), 1), 
+    patients = n_distinct(patient_uuid),
+    .groups = 'drop') %>%
+  
+  mutate(
+    # Percentage of readmissions
+    readmission_percentage = round((readmission_count / sum(readmission_count)) * 100, 1),
+  ) %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r summary table of 30-day UHRs, echo=FALSE, message=FALSE, warning=FALSE}
+# transpose data
+readmissions_summary_t <- readmissions_summary %>%
+  
+  mutate(
+    `n (%)` = paste0(readmission_count, " (", readmission_percentage, ")"),
+    `Mean (sd)` = paste0(mean_readmission_per_patient, " (", sd_readmission_per_patient, ")"),
+    `Median [Q1-Q3]` = paste0(median_readmission_per_patient, " [", p25_readmission_per_patient, "-", p75_readmission_per_patient, "]")
+  ) %>%
+  
+  dplyr::select(
+    annual_age_groups,
+    `n (%)`,
+    `Mean (sd)` ,
+    `Median [Q1-Q3]`,
+    `Patients (N)` = patients) %>%
+  
+  mutate(across(everything(), as.character)) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+# summary table
+kable(readmissions_summary_t, format = "html", caption = "Table 4. Summary of 30-day unplanned hospital readmissions (30-day UHRs) during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") %>%
+  footnote(
+    general = "Patients at risk of 30-day UHRs are those with at least one prior admission since start of follow-up.",
+    general_title = "***",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Age groups defined by patient's age at admission event.",
+    general_title = "**",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "A 30-day unplanned hospital readmission is defined as a subsequent unplanned admission within 30 days following an index discharge date. If multiple 30-day UHRs occur within the same 30-day window after last index discharge, only the first event of 30-day UHRs is counted.",
+    general_title = "*",
+    footnote_as_chunk = TRUE)
+
+readmissions_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/readmissions_summary_table.csv")
+```
+
+```{r 30-day UHRs per patient plot, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE, dpi = 300}
+readmissions_plot <- ggplot(readmissions_summary, aes(x = annual_age_groups, y =  mean_readmission_per_patient, fill = case_when(annual_age_groups %in% 
+        c("[0,1)", "[1,2)") ~ "(0-2]",
+      TRUE ~ "(2-12]" ))) +
+  
+  geom_col(position = "dodge", width = 0.6) + 
+  
+  # geom_text(aes(label = paste0("N = ", patients)), vjust = -3.5, size = 2.2) +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Mean number of 30-day UHRs per patient",
+    fill = "Age group") +
+  
+  scale_fill_manual(values = c( "(2-12]" = "black", 
+                                  "(0-2]" = "grey")) + 
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 2, 1), limits = c(0, 2)) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA), 
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 11, face = "bold", margin = margin(r = -18)),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_blank(),
+    legend.title = element_text(size = 11),
+    legend.position = "bottom",
+    legend.text = element_text(size = 11),
+    
+    # Adjust margins and panel spacing
+    plot.margin = margin(5, 5, 5, 5),  # Reduce whitespace around the plot
+    panel.spacing = unit(0, "lines"),  # Reduce spacing between plot elements
+    
+    # Fix aspect ratio to reduce vertical stretch
+    aspect.ratio = 0.3  # Lower values make it more compact
+  )
+
+readmissions_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/30-day_UHRs_per_patient_plot.png", 
+       readmissions_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+```{r illustrative plot of 30-day UHRs, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE, dpi = 300}
+#### Explanatory figure ------------------------------------------------
+readmission_example_plot <- readmissions_subgrouping %>%
+  
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    length_of_stay_days,
+    readmission,
+    valid_readmission
+  ) %>%
+  
+  distinct() %>%
+  
+  ungroup() %>%
+  
+  # patient with 3 subsequent admissions in less than 30 day after index admission
+  filter(patient_uuid == "b6808b7f-9119-475a-bd19-e3a7dc723fed") %>%
+  
+  left_join(rare_disease_followup_durations_days, by = "patient_uuid") %>%
+  
+  mutate(
+    patient_label = "Patient example",
+    followup_duration = last_record_age_days - first_record_age_days,
+  ) %>%
+  mutate(
+    # Dynamically update last_index_discharge by keeping the most recent "index" discharge
+    last_index_discharge = if_else(readmission == "index", admission_age_days_lastDate, NA_real_),
+    
+    # Fill forward the last_index_discharge for the patient
+    last_index_discharge = zoo::na.locf(last_index_discharge, na.rm = FALSE),
+    
+    # Calculate the time difference between last admission with the last index discharge
+    time_diff = admission_age_days_firstDate - last_index_discharge
+    ) %>%
+  
+  mutate(
+    readmission_label = case_when(
+      valid_readmission == "Index" ~ "Index discharge day",
+      valid_readmission == "Yes" ~ "30-day UHRs",
+      valid_readmission == "No" ~ "not counted readmission"
+    )
+  ) %>%
+  ggplot(.) +
+  scale_alpha_manual(name = "", values = 1) +
+  geom_linerange(
+    aes(y = patient_label, xmin = 1, xmax = 80),
+    linetype = "dashed",
+    size = .2,
+    
+  ) +
+  
+  geom_segment(aes(x = 39, xend = 69, y = 1.05, yend = 1.05), 
+               color = "black", size = 0.2) +
+  
+  # Add left arrow at x = 39
+  geom_segment(aes(x = 39, xend = 36, y = 1.05, yend = 1.05), 
+               color = "black", size = 0.2, 
+               arrow = arrow(type = "closed", length = unit(0.2, "cm"))) +
+  
+  # Add right arrow at x = 69
+  geom_segment(aes(x = 66, xend = 69, y = 1.05, yend = 1.05), 
+               color = "black", size = 0.2, 
+               arrow = arrow(type = "closed", length = unit(0.2, "cm"))) +
+  
+  # Add label above the line
+  annotate("text", x = 52, y = 1.1, label = "30-day window after index discharge (day 39)",
+           size = 3) +
+  
+  geom_point(
+    aes(
+      x = admission_age_days_firstDate,
+      y = patient_label,
+      colour = factor(readmission_label)
+    ),
+    shape = 18,
+    size = 5,
+    show.legend = TRUE
+  ) +
+  geom_text(
+    aes(
+      x = admission_age_days_firstDate,
+      y = patient_label,
+      label = case_when(
+        readmission_label == "30-day UHRs" ~ as.character(paste0("day ", abs(admission_age_days_firstDate))),
+        readmission_label == "not counted readmission" ~ as.character(paste0("day ", abs(admission_age_days_firstDate))
+      ))
+    ),
+    size = 3,
+    hjust = 0.5,
+    vjust = -1,
+    nudge_y = - 0.08) +
+  scale_colour_manual(
+    values = c(
+      "30-day UHRs" = "blue",
+      "not counted readmission" = "grey",
+      "Index discharge day" = "red"
+    ),
+    labels = c(  
+      "Index discharge day" = "Index admission",
+      "30-day UHRs" = "30-day UHRs",
+      "not counted readmission" = "Not counted readmission"
+    ),
+    name = "Legend"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 80, 5),
+    limits = c(0, 80)
+  ) +
+  labs(x = "Follow-up time (days)") +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA), 
+    axis.text.x = element_text(size = 7),
+    axis.text.y = element_text(size = 7, face = "bold", margin = margin(r = -18)),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_blank(),
+    legend.title = element_text(size = 9),
+    legend.position = "bottom",
+    legend.text = element_text(size = 9)
+  )
+
+
+readmission_example_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/readmissions_example.png", 
+       readmission_example_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+#### Respiratory support
+
+```{r ther. procedures derivation updated, echo=TRUE, message=FALSE, warning=FALSE}
+rare_disease_therapeutic_subgr_all <- rare_disease_therapeutic_procedures %>%
+  
+  # Filter rows with terms related to respiratory support
+  filter(str_detect(procedure, regex("ventil|oxygen|tracheostomy|tracheotomy", ignore_case = TRUE))) %>%
+  
+  # Select relevant columns with dates of procedures
+  ## first and last date columns were not used in ther.procedures due to procedures with first/last date are not related to respiratory support (i.e. ketogenic diet, Nissen fundoplication, Insertion of gastrostomy tube and Phototherapy)
+  dplyr::select(patient_uuid, procedure, procedure_age_days_date) %>%
+  
+  # remove duplicates
+  distinct() %>%
+  
+  # Convert procedure to factor for consistency
+  mutate(procedure = factor(procedure)) %>%
+  
+  # Group by patient and admission periods
+  group_by(patient_uuid) %>%
+  
+  # Derivation of therapeutic procedure follow-up day and get some missing dates from first date
+  mutate(
+    
+    procedure_age = procedure_age_days_date / 365.25,
+    
+    # Derivation of age at seizure in 1-year intervals
+    annual_age_groups = cut(
+      procedure_age,
+      breaks = c(0:12, Inf),
+      right = F,
+      include.lowest = T)
+  ) %>%
+  
+  # Filter out ages greater than 12 years
+  filter(procedure_age < 12)
+```
+
+```{r clinical diagnosis resp. derivation, echo=TRUE, message=FALSE, warning=FALSE}
+# obtaining events with respiratory support term
+rare_disease_clinical_diagnosis_subgr_all <- rare_disease_clinical_diagnosis %>%
+    
+  # Convert procedure to factor for consistency and rename as procedure for binding rows
+  mutate(procedure = factor(clinical_diagnosis)) %>%
+  
+  # Filter rows with terms related to respiratory support and exclude hypoventilation
+  filter(
+    str_detect(procedure, regex("ventil|oxygen|tracheostomy|tracheotomy", ignore_case = TRUE)) &
+    !str_detect(procedure, regex("hypoventilation", ignore_case = TRUE))
+  ) %>%
+
+  # Select relevant columns
+  dplyr::select(patient_uuid, procedure, clinical_diagnosis_age_days_firstDate, clinical_diagnosis_age_days_lastDate) %>%
+  
+  # remove duplicates
+  distinct(.keep_all = TRUE)
+
+
+# derivation of group of age for each diagnosis
+rare_disease_clinical_diagnosis_subgr_all <- rare_disease_clinical_diagnosis_subgr_all %>%
+  
+  group_by(patient_uuid, procedure) %>% 
+  
+  # Arrange data for detecting gaps
+  arrange(
+    clinical_diagnosis_age_days_firstDate,
+    desc(clinical_diagnosis_age_days_lastDate)
+  ) %>%
+  
+  # Identify episodes of respiratory support
+  mutate(
+    ## find the largest end date from current row to row 1 (for each pat/medic combination)
+    max_end = purrr::accumulate(clinical_diagnosis_age_days_lastDate, max),
+    
+    ## computes the difference between current start and the end of the previous row
+    date_diff = clinical_diagnosis_age_days_firstDate - lag(max_end, default = T),
+    
+    ## if date_diff is >=2 (episod starts more than 1 day after the end of the previous), episod is incremented 1
+    episod = purrr::accumulate(date_diff >= 2, sum, na.rm = TRUE)
+  ) %>%
+  
+  group_by(patient_uuid, procedure, episod) %>%
+
+  arrange(patient_uuid, procedure, clinical_diagnosis_age_days_firstDate) %>%
+
+  summarize(
+    procedure_age_days_firstDate = min(clinical_diagnosis_age_days_firstDate),
+    procedure_age_days_lastDate = max(clinical_diagnosis_age_days_lastDate),
+    procedure_duration = (procedure_age_days_lastDate - procedure_age_days_firstDate) + 1,
+    .groups = "drop"
+  ) %>%
+
+  # Expand medication periods to capture all ages during follow-up
+  rowwise() %>%
+  
+  # create list with age sequence per patient increasing by 1 unit to capture an aprox moment of the year window in which the patient was under the medication
+  mutate(age_sequence = list(
+    seq(
+      from = procedure_age_days_firstDate / 365.25,
+      to = procedure_age_days_lastDate / 365.25,
+      by = 1
+    ) %>%
+      unique() %>%  # Ensure unique ages in case rounding causes overlaps
+      c(procedure_age_days_lastDate / 365.25) # Explicitly include the exact last medication intake
+  )) %>%
+  
+  unnest(cols = c(age_sequence)) %>% # returns list to rows
+  
+  mutate(
+    procedure_age = age_sequence, # exact age for first and last record
+
+    # Derivation of age at seizure in 1-year intervals
+    annual_age_groups = cut(
+      procedure_age,
+      breaks = c(0:12, Inf),
+      right = F,
+      include.lowest = T)
+    
+  ) %>%
+  
+  filter(procedure_age < 12) %>%
+  
+  arrange(patient_uuid, procedure, episod, procedure_age_days_lastDate) %>%
+  
+  group_by(patient_uuid, procedure, episod, annual_age_groups) %>%
+  
+  slice_tail(n = 1) %>%  # Keep the last row (last medication intake) within each sub grouping if duplicates exist
+  
+  ungroup() %>%
+  
+  dplyr::select(patient_uuid, annual_age_groups, procedure_age, procedure_age_days_firstDate, procedure_age_days_lastDate, procedure)
+```
+
+```{r joining databases. derivation, echo=TRUE, message=FALSE, warning=FALSE}
+# Joining clinical diagnosis and therapeutic procedures datasets
+respiratory_sup_subgrouping <-  
+  bind_rows(
+    rare_disease_clinical_diagnosis_subgr_all %>% mutate(source = "clinical_diagnosis"),
+    rare_disease_therapeutic_subgr_all %>% mutate(source = "therapeutic")
+  )  %>%
+  
+  # Filter records from therapeutic procedures that do not have the same date for clinical diagnosis
+  filter(!(source == "therapeutic" & procedure_age_days_firstDate %in% rare_disease_clinical_diagnosis_subgr_all$procedure_age_days_firstDate)) %>%
+  
+  mutate(
+    resp_support = "Yes"
+  )
+
+
+# add rows with patients under risk but without records
+respiratory_sup_subgrouping <- follow_up_patients_uuid %>%
+  
+  left_join(respiratory_sup_subgrouping, by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  mutate(
+    resp_support = replace_na(resp_support, "No")
+  ) %>%
+  
+  arrange(patient_uuid, annual_age_groups)
+```
+
+```{r summary of respiratory support events by age group, echo=TRUE, message=FALSE, warning=FALSE}
+# respiratory support events by age group
+respiratory_support_summary <- respiratory_sup_subgrouping %>%
+  
+  group_by(patient_uuid, annual_age_groups) %>%
+  
+  summarise(
+    respiratory_sup_count_per_patient = sum(resp_support == "Yes"),
+    .groups = 'drop'
+  ) %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  summarise(
+    # Total number of respiratory support procedures
+    respiratory_sup_count = round(sum(respiratory_sup_count_per_patient), 1),
+    # Mean of respiratory support procedures per patient
+    mean_resp_sup_per_patient = round(mean(respiratory_sup_count_per_patient), 1),
+    # Standard deviation of respiratory support procedures per patient
+    sd_resp_sup_per_patient = round(sd(respiratory_sup_count_per_patient), 1),
+    # Median of respiratory support procedures per patient
+    median_resp_sup_per_patient = round(median(respiratory_sup_count_per_patient), 1),
+    # 25th percentile (Q1)
+    p25_resp_sup_per_patient = round(quantile(respiratory_sup_count_per_patient, 0.25), 1),
+    # 75th percentile (Q3)
+    p75_resp_sup_per_patient = round(quantile(respiratory_sup_count_per_patient, 0.75), 1),
+    # Number of patients under follow up
+    patients = n_distinct(patient_uuid),
+    .groups = 'drop'
+  ) %>%
+
+  mutate(
+    # Percentage of total rescue medications
+    resp_supp_percentage = round((respiratory_sup_count / sum(respiratory_sup_count)) * 100, 1),
+  ) %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r summary table of respiratory support events by age group, echo=TRUE, message=FALSE, warning=FALSE}
+# transpose table
+respiratory_support_summary_t <- respiratory_support_summary %>%
+  
+  mutate(
+    `n (%)` = paste0(respiratory_sup_count,
+                     " (",
+                     resp_supp_percentage,
+                     ")"),
+    `Mean (sd)` = paste0(mean_resp_sup_per_patient,
+                         " (",
+                         sd_resp_sup_per_patient,
+                         ")"),
+    `Median [Q1-Q3]` = paste0(median_resp_sup_per_patient,
+                              " [",
+                              p25_resp_sup_per_patient,
+                              "-",
+                              p75_resp_sup_per_patient,
+                              "]")
+    ) %>%
+  
+  dplyr::select(
+    annual_age_groups,
+    `n (%)`,
+    `Mean (sd)`, 
+    `Median [Q1-Q3]`, 
+    `Patients (N)` = patients
+    ) %>%
+  
+  mutate(across(everything(), as.character)
+         ) %>%
+  
+  pivot_longer(cols = -annual_age_groups, 
+               names_to = "Metric", 
+               values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, 
+              values_from = Value) 
+
+# summary kable
+kable(respiratory_support_summary_t, format = "html", caption = "Table 6. Summary of respiratory support* events during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2")  %>%
+  footnote(
+    general = "Age groups defined by age at start and end of clinical diagnosis event or age at therapeutic procedure event.",
+    general_title = "**",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Respiratory support records for a specific procedure/clinical diagnosis with continuous dates (< 2 days of gap) were grouped into episodes.",
+    general_title = "***",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Respiratory support procedures are based on the occurrence of 'ventil|oxygen|tracheostomy|tracheotomy' procedures, according to the 'procedure' and 'clinical diagnosis' variables from clinical diagnosis and therapeutic procedures files.",
+    general_title = "*",
+    footnote_as_chunk = TRUE)
+
+respiratory_support_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/resp.support_summary_table.csv")
+```
+
+```{r respiratory support per patient plot, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE, dpi = 300}
+resp_supp_plot <- ggplot(respiratory_support_summary, aes(x = annual_age_groups, y =  mean_resp_sup_per_patient, fill = 
+                                                            case_when(annual_age_groups %in% c("[0,1)", "[1,2)") ~ "(0-2]",
+                                                                      TRUE ~ "(2-12]" ))) +
+  
+  geom_col(position = "dodge", width = 0.6) +  
+  
+  #geom_text(aes(label = paste0("N = ", patients)), vjust = -3.5, size = 2.2) +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Mean number of respiratory support procedures per patient",
+    fill = "Age group") +
+  
+  scale_fill_manual(values = c(
+    "(0-2]" = "grey", 
+    "(2-12]" = "black")) + 
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 2, 1), limits = c(0, 2)) +
+  
+  theme(
+  axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+resp_supp_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/resp_supp_per_patient_plot.png", 
+       resp_supp_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+#### Medication
+
+##### Rescue medication
+
+```{r Medication derivation, echo=TRUE, message=FALSE, warning=FALSE}
+rescue_med_subgrouping <- rare_disease_medication %>%
+  
+  # Select relevant columns
+  dplyr::select(
+    patient_uuid,
+    medication_age_days_firstDate,
+    medication_age_days_lastDate,
+    medication
+    ) %>%
+
+  # Derivation of medication day during follow-up
+  mutate(
+    
+    # Derivation of age at medication start
+    age_medication = medication_age_days_firstDate / 365.25, 
+
+    # Derivation of age groups based on age at medication prescription
+    annual_age_groups = cut(
+      age_medication,
+      breaks = c(0:12, Inf),
+      right = F,
+      include.lowest = T),
+    
+    # Derivation of rescue medication based on age at first and last day of medication
+  rescue_medication = factor(
+    ifelse(
+      # list obtained from epilepsy foundation
+      medication %in% c("Diazepam",
+                        "Lorazepam",
+                        "Midazolam", 
+                        "Clonazepam", 
+                        "Clorazepate"
+                        ) &
+        medication_age_days_firstDate == medication_age_days_lastDate,
+      "Yes",
+      "No"
+    ),
+    levels = c("Yes", "No")
+  )
+  ) %>% 
+
+  # Filter out records outside the age range 
+  filter(age_medication < 12) %>%
+
+  # distinct records to remove duplicates
+  distinct(
+    patient_uuid,
+    medication_age_days_firstDate,
+    medication_age_days_lastDate,
+    medication,
+    .keep_all = TRUE) %>%
+  
+  # keep selected columns in order
+  dplyr::select(
+    patient_uuid,
+    medication,
+    rescue_medication,
+    age_medication,
+    annual_age_groups,
+    medication_age_days_firstDate,
+    medication_age_days_lastDate
+  ) %>%
+  
+  # arrange by patient uuid
+  arrange(patient_uuid, medication_age_days_firstDate)
+
+
+# add rows with patients under risk but without records
+rescue_med_subgrouping <- follow_up_patients_uuid %>%
+  
+  left_join(rescue_med_subgrouping, by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  mutate(
+    rescue_medication = replace_na(rescue_medication, "No")
+  ) %>%
+  
+  arrange(patient_uuid, annual_age_groups)
+```
+
+```{r summary of rescue medication by age group, echo=FALSE, message=FALSE, warning=FALSE}
+# rescue medication summary
+rescue_med_summary <- rescue_med_subgrouping %>%
+  
+  group_by(patient_uuid, annual_age_groups) %>%
+  
+  # summary by patient at age group
+  summarise(
+    resc_med_count_per_patient = sum(rescue_medication == "Yes"),
+    .groups = 'drop'
+  ) %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  # summary across age group
+  summarise(
+    # Total number of rescue medications
+    resc_med_count = round(sum(resc_med_count_per_patient), 1),
+    # Mean of rescue medications per patient
+    mean_resc_med_per_patient = round(mean(resc_med_count_per_patient), 1),
+    # Standard deviation of rescue medications per patient
+    sd_resc_med_per_patient = round(sd(resc_med_count_per_patient), 1),
+    # Median of rescue medications per patient
+    median_resc_med_per_patient = round(median(resc_med_count_per_patient), 1),
+    # 25th percentile (Q1)
+    p25_resc_med_per_patient = round(quantile(resc_med_count_per_patient, 0.25), 1),
+    # 75th percentile (Q3)
+    p75_resc_med_per_patient = round(quantile(resc_med_count_per_patient, 0.75), 1),
+    # patient under follow up
+    patients = n_distinct(patient_uuid),
+    .groups = 'drop'
+  ) %>%
+  
+  mutate(
+    # Percentage of total rescue medications
+    resc_med_percentage = round((resc_med_count / sum(resc_med_count)) * 100, 1),
+  ) %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r summary table - rescue medication by age group, echo=FALSE, message=FALSE, warning=FALSE}
+# transpose table
+rescue_med_summary.t <- rescue_med_summary %>%
+  
+  mutate( 
+    `n (%)` = paste0(resc_med_count, 
+                     " (",
+                     resc_med_percentage,
+                     ")"),
+    `Mean (sd)` = paste0(mean_resc_med_per_patient,
+                         " (",
+                         sd_resc_med_per_patient,
+                         ")"),
+    `Median [Q1-Q3]` = paste0(median_resc_med_per_patient, 
+                              " [", 
+                              p25_resc_med_per_patient, 
+                              "-",
+                              p75_resc_med_per_patient,
+                              "]")
+  ) %>%
+  dplyr::select(
+    annual_age_groups,
+    `n (%)`, 
+    `Mean (sd)`, 
+    `Median [Q1-Q3]`,
+    `Patients (N)` = patients
+    ) %>%
+  
+  mutate(across(everything(), as.character)
+         ) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+# kable summary table
+kable(rescue_med_summary.t, format = "html", caption = "Table 7. Summary of total rescue medication prescriptions during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2")  %>%
+  footnote(
+    general = "Records with missing values in dose and unit are counted.",
+    general_title = "***",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Age groups defined by age at medication (earliest report of medication/dose in record).",
+    general_title = "**",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Rescue medication is defined as one-off use administration of benzodiazepines to treat acute repetitive seizures or clusters. This includes diazepam, lorazepam, midazolam, clorazepate and clonazepam.",
+    general_title = "*",
+    footnote_as_chunk = TRUE)
+
+rescue_med_summary.t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/rescue_med_summary_table.csv")
+```
+
+```{r rescue medication per patient plot, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE,  dpi = 300}
+resc_med_plot <- ggplot(rescue_med_summary, aes(x = annual_age_groups, y =  mean_resc_med_per_patient, fill = case_when(
+      annual_age_groups %in% c("[0,1)", "[1,2)") ~ "(0-2]", TRUE ~ "(2-12]"
+    ))) +
+  
+  geom_col(position = "dodge", width = 0.6) + 
+  
+  #geom_text(aes(label = paste0("N = ", patients)), vjust = -3.5, size = 2.2) +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Mean of rescue medication per patient",
+    fill = "Age group")  +
+  
+  scale_fill_manual(values = c( "(2-12]" = "black", 
+                                  "(0-2]" = "grey")) + 
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 7, 1), limits = c(0, 7)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+resc_med_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/resc_med_per_patient_plot.png", 
+       resc_med_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+##### Anti-seizure medication
+
+```{r derivation of antiseizure medication episodes, echo=TRUE, message=FALSE, warning=FALSE}
+medication_antiseizure_subgrouping <- rare_disease_medication %>% 
+      
+  # 35 total medications (A Summary of Antiseizure Medications Available in the United States: 4th Edition) 2024
+  filter(medication %in% c("Brivaracetam", 
+                           "Carbamazepine", 
+                           "Cenobamate", 
+                           "Clobazam", 
+                           "Clonazepam", 
+                           "Diazepam", 
+                           "Divalproex", 
+                           "Eslicarbazepine acetate",
+                           "Ethosuximide", 
+                           "Epidiolex", # cannabidiol (CBD)
+                           "Everolimus", 
+                           "Felbamate", 
+                           "Fenfluramine", 
+                           "Fosphenytoin", 
+                           "Gabapentin", 
+                           "Ganaloxone", 
+                           "Lacosamide", 
+                           "Lamotrigine", 
+                           "Levetiracetam", 
+                           "Lorazepam", 
+                           "Midazolam", 
+                           "Oxcarbazepine",
+                           "Perampanel", 
+                           "Phenobarbital", 
+                           "Phenytoin",
+                           "Pregabalin", 
+                           "Primidone", 
+                           "Rufinamide", 
+                           "Stiripentol", 
+                           "Tiagabine", 
+                           "Topiramate", 
+                           "Valproic acid", 
+                           "Vigabatrin", 
+                           "Zonisamide")) %>% 
+  
+  dplyr::select(
+    patient_uuid, 
+    medication, 
+    medication_age_days_firstDate, 
+    medication_age_days_lastDate) %>% 
+  
+  ## remove duplicate rows (not taking dose into account for this analysis)
+  distinct() %>% 
+  
+  group_by(patient_uuid, medication) %>%
+  
+  arrange(
+    medication_age_days_firstDate,
+    desc(medication_age_days_lastDate)
+  ) %>%
+  
+  # Identify episodes (Identify the longest prescription windows and remove the nested ones)
+  mutate(
+    ## find the largest end date from current row to row 1 (for each pat/medic combination)
+    max_end = purrr::accumulate(medication_age_days_lastDate, max),
+    
+    ## computes the difference between current start and the end of the previous row
+    date_diff = medication_age_days_firstDate - lag(max_end, default = T),
+    
+    ## if date_diff is >=2 (episod starts more than 1 day after the end of the previous), episod is incremented 1
+    episod = purrr::accumulate(date_diff >= 2, sum, na.rm = TRUE)
+  ) %>%
+  
+  # Group by patient, medication, and episode to identify distinct prescription windows
+  group_by(patient_uuid, medication, episod) %>%
+  
+  arrange(patient_uuid, medication, medication_age_days_firstDate) %>%
+  
+  summarise(
+    medication_age_days_firstDate = min(medication_age_days_firstDate),
+    medication_age_days_lastDate = max(medication_age_days_lastDate),
+    .groups = "drop"
+  ) %>%
+  
+  # remove prescriptions initiated after 12 years in days
+  filter(medication_age_days_firstDate <= MAX_DAYS_12_YEARS) %>%
+  
+  # Truncate medication_age_days_lastDate to the last day is higher than 12 years (in days) to avoid overestimation of prescription duration in the lattest group of age (to check)
+  mutate(
+    medication_age_days_lastDate = if_else(
+      medication_age_days_lastDate > MAX_DAYS_12_YEARS,
+      MAX_DAYS_12_YEARS,
+      medication_age_days_lastDate
+    ),
+    prescr_duration = medication_age_days_lastDate - medication_age_days_firstDate + 1
+  )
+```
+
+###### a. Total ASMs prescriptions
+
+```{r total ASM by age group, echo=TRUE, message=FALSE, warning=FALSE}
+total_asm_subgr <- medication_antiseizure_subgrouping %>%
+
+  # Expand medication periods to capture all ages during follow-up
+  rowwise() %>%
+
+  mutate(
+    age_sequence = list(
+      seq(
+      from = medication_age_days_firstDate / 365.25,
+      to = medication_age_days_lastDate / 365.25,
+      by = 1 # by 1 year increase
+    ) %>%
+      
+      # Ensure unique ages in case rounding causes overlaps
+      unique() %>%  
+      
+      # finish the sequence with the last date of medication intake
+      c(medication_age_days_lastDate / 365.25)
+    
+  )) %>%
+
+  unnest(cols = c(age_sequence)) %>%
+
+  mutate(
+    
+    # age at medication prescription
+    age_medication = age_sequence,
+
+    # Derivation of in 1-year intervals
+    annual_age_groups = cut(
+      age_medication,
+      breaks = c(0:12, Inf),
+      right = F,
+      include.lowest = T)
+  ) %>%
+  
+  arrange(patient_uuid, medication, episod, medication_age_days_lastDate) %>%
+
+  # Keep the last row (last medication intake) within each sub grouping if duplicates exist
+  group_by(patient_uuid, medication, episod, annual_age_groups) %>%
+  
+  slice_tail(n = 1) %>%  
+  
+  ungroup() %>%
+
+  # Filter out records outside the age range
+  filter(age_medication < 12) %>%
+
+  mutate(
+    antiseizure_med = "Yes"
+  ) %>%
+
+  # Keep selected columns for further processing
+  dplyr::select(
+    patient_uuid,
+    medication,
+    age_medication,
+    annual_age_groups,
+    medication_age_days_firstDate,
+    medication_age_days_lastDate,
+    prescr_duration,
+    antiseizure_med
+  ) %>%
+
+  # Arrange by patient uuid
+  arrange(patient_uuid, medication, medication_age_days_firstDate)
+
+
+# add rows with patients under risk but without records
+total_asm_subgr <- follow_up_patients_uuid %>%
+  
+  left_join(total_asm_subgr, by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  mutate(
+    antiseizure_med = replace_na(antiseizure_med, "No")
+  ) %>%
+  
+  # Arrange by patient uuid
+  arrange(patient_uuid, medication, medication_age_days_firstDate)
+```
+
+```{r summary of total ASM prescriptions by age group, echo=FALSE, message=FALSE, warning=FALSE}
+# asm medication summary
+antiseizure_med_summary <- total_asm_subgr %>%
+  
+  group_by(patient_uuid, annual_age_groups) %>%
+  
+  # summary by patient at age group
+  summarise(
+    antiseizure_med_count_per_patient =
+      sum(antiseizure_med == "Yes"),
+    .groups = 'drop'
+  ) %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  # summary across age groups
+  summarise(
+    # Total number of rescue medications per age group
+    antiseizure_med_count = round(sum(antiseizure_med_count_per_patient), 1),
+    # Mean of rescue medications per patient
+    mean_antiseizure_med_per_patient = round(mean(antiseizure_med_count_per_patient), 1),
+    # Standard deviation of rescue medications per patient
+    sd_antiseizure_med_per_patient = round(sd(antiseizure_med_count_per_patient), 1),
+    # Median of rescue medications per patient
+    median_antiseizure_med_per_patient = round(median(antiseizure_med_count_per_patient), 1),
+    # 25th percentile (Q1)
+    p25_antiseizure_med_per_patient = round(quantile(antiseizure_med_count_per_patient, 0.25), 1),
+    # 75th percentile (Q3)
+    p75_antiseizure_med_per_patient = round(quantile(antiseizure_med_count_per_patient, 0.75), 1),
+    # patiens under follow up
+    patients = n_distinct(patient_uuid),
+    .groups = 'drop'
+  ) %>%
+  
+  mutate(
+    # Percentage of total rescue medications
+    antiseizure_med_percentage = round((antiseizure_med_count / sum(antiseizure_med_count)) * 100, 1),
+  ) %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r summary table - total ASM prescriptions by age group, echo=FALSE, message=FALSE, warning=FALSE}
+# transpose table
+antiseizure_med_summary_t <- antiseizure_med_summary %>%
+  
+  mutate( 
+    `n (%)`= paste0(antiseizure_med_count,
+                    " (", 
+                    antiseizure_med_percentage,
+                    ")"),
+    `Mean (sd)` = paste0(mean_antiseizure_med_per_patient,
+                         " (", 
+                         sd_antiseizure_med_per_patient,
+                         ")"),
+    `Median [Q1-Q3]` = paste0(median_antiseizure_med_per_patient, 
+                              " [",
+                              p25_antiseizure_med_per_patient, 
+                              "-", 
+                              p75_antiseizure_med_per_patient, 
+                              "]")
+  ) %>%
+  dplyr::select(
+    annual_age_groups,
+    `n (%)`, 
+    `Mean (sd)` ,
+    `Median [Q1-Q3]`,
+    `Patients (N)` = patients
+    ) %>%
+  
+  mutate(across(everything(), as.character)
+         ) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+# kable summary table
+kable(antiseizure_med_summary_t, format = "html", caption = "Table 8. Summary of total anti-seizure medication prescriptions during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2")  %>%
+  footnote(
+    general = "Age groups reflect the patient's age range during the medication period, calculated from the first and last recorded dates of intake.",
+    general_title = "***",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Antiseizure medication is defined as pharmacological treatments used to prevent or reduce the frequency and severity of seizures. This includes medications from various classes such as Brivaracetam, Lamotrigine, Levetiracetam, and others commonly prescribed for seizure management taken from https://www.epilepsy.com/tools-resources/seizure-medication-list",
+    general_title = "**",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Prescriptions with no information about dose/unit are counted.",
+    general_title = "*",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Medication use records with a specific medication name with continuous dates (< 2 days of gap) were grouped into the same episode.",
+    general_title = "****",
+    footnote_as_chunk = TRUE)
+
+antiseizure_med_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/antiseizure_med_summary_table.csv")
+```
+
+```{r antiseizure medication per patient plot, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE,  dpi = 300}
+antiseizure_med_plot <- ggplot(antiseizure_med_summary, aes(x = annual_age_groups, y =  mean_antiseizure_med_per_patient, fill = case_when(
+      annual_age_groups %in% c("[0,1)", "[1,2)") ~ "(0-2]", TRUE ~ "(2-12]"
+    ))) +
+  
+  geom_col(position = "dodge", width = 0.6) + 
+  
+  #geom_text(aes(label = paste0("N = ", patients)), vjust = -3.5, size = 2.2) +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Mean of ASMs prescriptions per patient",
+    fill = "Age group")  +
+  
+  scale_fill_manual(values = c( "(2-12]" = "black", 
+                                  "(0-2]" = "grey")) + 
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 23, 1), limits = c(0, 23)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+antiseizure_med_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/antiseizure_med_per_patient_plot.png", 
+       antiseizure_med_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+###### b. Distinct Anti-seizure medication prescription
+
+```{r summary of number of different ASM prescriptions by age group, echo=FALSE, message=FALSE, warning=FALSE}
+# Summary of different medications by age group
+different_med_summary <- total_asm_subgr %>%
+  
+  group_by(patient_uuid, annual_age_groups) %>%
+  
+  # number of different medications by patient at the age group
+  summarise(different_med_count_per_patient = n_distinct(medication),
+            .groups = 'drop') %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  # Summary of different medications across age groups
+  summarise(
+    # Total number of different medications per age group
+    mean_different_med_per_patient = round(mean(different_med_count_per_patient), 1),
+    # Standard deviation of different medications per patient
+    sd_different_med_per_patient = round(sd(different_med_count_per_patient), 1),
+    # Median of different medications per patient
+    median_different_med_per_patient = round(median(different_med_count_per_patient), 1),
+    # 25th percentile (Q1)
+    p25_different_med_per_patient = round(quantile(different_med_count_per_patient, 0.25), 1),
+    # 75th percentile (Q3)
+    p75_different_med_per_patient = round(quantile(different_med_count_per_patient, 0.75), 1),
+    # Number of patients under follow up
+    patients = n_distinct(patient_uuid),
+    .groups = 'drop'
+  ) %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r summary table - number of different ASM prescriptions by age group, echo=FALSE, message=FALSE, warning=FALSE}
+# Transpose table for display
+different_med_summary_t <- different_med_summary %>%
+  mutate( 
+    `Mean (sd)` = paste0(mean_different_med_per_patient,
+                         " (",
+                         sd_different_med_per_patient,
+                         ")"),
+    `Median [Q1-Q3]` = paste0(median_different_med_per_patient, 
+                               " [", 
+                               p25_different_med_per_patient, 
+                               "-", 
+                               p75_different_med_per_patient, 
+                               "]")
+  ) %>%
+  dplyr::select(annual_age_groups,
+                `Mean (sd)` ,
+                `Median [Q1-Q3]`,
+                `Patients (N)` = patients) %>%
+  
+  mutate(across(everything(), as.character)) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+# Create kable summary table
+kable(different_med_summary_t, format = "html", caption = "Table 9. Summary of unique anti-seizure medications during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2")  %>%
+  footnote(
+    general = "Age groups reflect the patient's age range during the medication period, calculated from the first and last recorded dates of intake.",
+    general_title = "**",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "A 'different medication' is defined as a unique medication name (e.g., Brivaracetam, Lamotrigine, etc.) taken at any point during the follow-up period.",
+    general_title = "*",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Medication use records with a specific medication name with continuous dates (< 2 days of gap) were grouped into the same episode.",
+    general_title = "***",
+    footnote_as_chunk = TRUE)
+
+different_med_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/different_med_summary_table.csv")
+```
+
+```{r number different antiseizure medication per patient plot, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE,  dpi = 300}
+asm_diff_plot <- ggplot(different_med_summary, aes(x = annual_age_groups, y =  mean_different_med_per_patient, fill = case_when(
+      annual_age_groups %in% c("[0,1)", "[1,2)") ~ "(0-2]", TRUE ~ "(2-12]"
+    ))) +
+  
+  geom_col(position = "dodge", width = 0.6) + 
+  
+ # geom_text(aes(label = paste0("N = ", patients)), vjust = -3.5, size = 2.2) +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Mean of unique ASMs per patient",
+    fill = "Age group")  +
+  
+  scale_fill_manual(values = c( "(2-12]" = "black", 
+                                  "(0-2]" = "grey")) + 
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 8, 1), limits = c(0, 8)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+asm_diff_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/asm.diff.plot.png", 
+       asm_diff_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+###### c. Active ASMs number
+
+```{r count of active ASM prescriptions by follow up day, echo=TRUE, message=FALSE, warning=FALSE}
+## Creating a new table to count active ASM prescriptions
+## To identify episodes with the same number of active ASMs, we need to count how many ASMs the patient receives for each day of follow-up
+act_asm_subgr <- medication_antiseizure_subgrouping %>%
+
+  rowwise() %>%
+
+  mutate(days =
+           list(
+             seq(
+               medication_age_days_firstDate, medication_age_days_lastDate,
+               by = 1))) %>%
+
+  unnest_longer(col = days) %>% # unnest days
+
+  group_by(patient_uuid, days) %>%
+
+  tally() %>% # n = number of concomitant ASMs for each day of follow-up
+
+  group_by(patient_uuid) %>%
+
+  mutate(episode_2 = data.table::rleid(n)) %>% ## Tally episodes when the patient has the same total number of ASM prescriptions
+
+  group_by(patient_uuid, episode_2) %>%
+
+  mutate(
+    start_episode_age_days = min(days),
+    end_episode_age_days = max(days),
+    duration = end_episode_age_days - start_episode_age_days + 1) %>% # compute the duration of each episodes with same number of ASM prescriptions
+
+  dplyr::select(-days) %>%
+
+  distinct()
+```
+
+```{r active ASM by age group, echo=TRUE, message=FALSE, warning=FALSE}
+act_asm_subgr <- act_asm_subgr %>%
+
+  # Add age subgrouping
+  mutate(
+    age_sequence = list(
+      seq(
+        from = start_episode_age_days / 365.25,
+        to = end_episode_age_days / 365.25,
+        by = 1
+      ) %>%
+        unique() %>%
+        c(end_episode_age_days / 365.25)
+    )
+  ) %>%
+  
+  unnest(cols = c(age_sequence)) %>%
+  
+  mutate(
+    age_medication = age_sequence,
+    
+    # Derivation of in 1-year intervals
+    annual_age_groups = cut(
+      age_medication,
+      breaks = c(0:12, Inf),
+      right = F,
+      include.lowest = T)
+  ) %>%
+
+  arrange(patient_uuid, episode_2, end_episode_age_days) %>%
+  
+  # Remove duplicates for the last age subgrouping records
+  group_by(patient_uuid, episode_2, annual_age_groups) %>%
+  
+  slice_tail(n = 1) %>%
+  
+  ungroup() %>%
+  
+  # Filter out records outside the defined age range
+  filter(!age_medication > 12) %>%
+
+  # Select and organize relevant columns
+  dplyr::select(
+    patient_uuid,
+    annual_age_groups,
+    start_episode_age_days,
+    end_episode_age_days,
+    n,
+    duration
+    ) %>%
+  
+  # Sort the final dataset
+  arrange(patient_uuid, start_episode_age_days)
+
+
+# add rows with patients under risk but without records
+act_asm_subgr <- follow_up_patients_uuid %>%
+  
+  left_join(act_asm_subgr, by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  # n will be kept as NA for patients without records due as computed 0 active during follow-up were not included in the derivation
+  mutate(
+    n = replace_na(n, NA),
+  ) %>%
+  
+  # Arrange by patient uuid
+  arrange(patient_uuid, start_episode_age_days)
+```
+
+```{r summary of active ASMs by age group, echo=TRUE, message=FALSE, warning=FALSE, cache=FALSE}
+# Calculate mean number of active medications per patient for each age group
+act_asm_summary <- act_asm_subgr %>%
+  
+  group_by(patient_uuid, annual_age_groups) %>%
+  
+  # mean number of active medications per patient
+  summarise(
+    mean_n_per_patient = mean(n, na.rm = TRUE), 
+    median_n_per_patient = median(n, na.rm = TRUE), 
+    .groups = "drop"
+  ) %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  # mean number of active medications across age groups
+  summarise(
+    # mean of active.medications per patient by age group
+    act_mean = round(mean(mean_n_per_patient, na.rm = TRUE), 1), 
+    # standard deviation for active medications per patient 
+    act_sd = round(sd(mean_n_per_patient, na.rm = TRUE), 1),
+    # median number of active.med per patient by age group
+    act_median = round(median(median_n_per_patient, na.rm = TRUE), 1),
+    # percentile 25%
+    act_p25 = round(quantile(median_n_per_patient, 0.25, na.rm = TRUE), 1),
+    # percentile 75%
+    act_p75 = round(quantile(median_n_per_patient, 0.75, na.rm = TRUE), 1),
+    # patient under follow-up
+    patients = n_distinct(patient_uuid),
+    .groups = "drop"
+  ) %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r summary table - active ASMs by age group, echo=TRUE, message=FALSE, warning=FALSE, cache=FALSE}
+# transpose table
+act_asm_med_summary.t <- act_asm_summary %>%
+  
+  mutate( 
+    `Mean (sd)` = paste0(act_mean, 
+                         " (",
+                         act_sd,
+                         ")"),
+    `Median [Q1-Q3]` = paste0(act_median,
+                              " [",
+                              act_p25,
+                              "-",
+                              act_p75,
+                              "]")
+  ) %>%
+  
+  dplyr::select(
+    annual_age_groups,
+    `Mean (sd)`,
+    `Median [Q1-Q3]`,
+    `Patients (N)` = patients) %>%
+  
+  mutate(across(everything(), as.character)) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+# kable summary table
+kable(act_asm_med_summary.t, format = "html", caption = "Table 8. Summary of concomitant medications during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") %>%
+  footnote(
+    general = "Age groups reflect the patient's age range during the medication period, calculated from the first and last recorded dates of intake.",
+    general_title = "**",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Antiseizure medication is defined as pharmacological treatments used to prevent or reduce the frequency and severity of seizures. This includes medications from various classes such as Brivaracetam, Lamotrigine, Levetiracetam, and others commonly prescribed for seizure management taken from https://www.epilepsy.com/tools-resources/seizure-medication-list",
+    general_title = "*",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "A concomitant medication is defined as the simultaneous use of two or more drugs to achieve the purpose of treatment  during the follow-up period.",
+    general_title = "*",
+    footnote_as_chunk = TRUE) %>%
+  footnote(
+    general = "Medication use records with a specific medication name with continuous dates (< 2 days of gap) were grouped into the same episode.",
+    general_title = "***",
+    footnote_as_chunk = TRUE)
+
+act_asm_med_summary.t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/act_asm_med_summary_table.csv")
+```
+
+```{r active asm per patient plot, echo=TRUE, fig.align='center', message=FALSE, warning=FALSE, dpi=300}
+act_med_plot <- ggplot(act_asm_summary, aes(x = annual_age_groups, y =  act_mean, fill = case_when(
+      annual_age_groups %in% c("[0,1)", "[1,2)") ~ "(0-2]", TRUE ~ "(2-12]"
+    ))) +
+  
+  geom_col(position = "dodge", width = 0.6) + 
+  
+ # geom_text(aes(label = paste0("N = ", patients)), vjust = -3.5, size = 2.2) +
+  
+  labs(
+    x = "Age Group (in years)",
+    y = "Mean of concomitant ASMs per patient",
+    fill = "Age group")  +
+  
+  scale_fill_manual(values = c( "(2-12]" = "black", 
+                                  "(0-2]" = "grey")) + 
+  
+  theme_minimal() +
+  
+  scale_y_continuous(breaks = seq(0, 4, 1), limits = c(0, 5)) +
+  
+  theme(
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.position = "bottom",   
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  )
+
+act_med_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/act_med_per_patient_plot.png", 
+       act_med_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+#### Growth parameters
+
+```{r Growth parameters derivation, echo=TRUE, message=FALSE, warning=FALSE}
+growth_parameters_subgrouping <- rare_disease_growth_parameters %>%
+  
+  # Select relevant columns
+  dplyr::select(
+    patient_uuid,
+    growth_parameter,
+    growth_parameter_value,
+    growth_parameter_unit,
+    growth_parameter_age_days
+  ) %>%
+  
+  # keeping only records without missing value/unit/age
+  filter(!is.na(growth_parameter_value)  | !is.na(growth_parameter_unit) | !is.na(growth_parameter_age_days)) %>% 
+  
+  # remove duplicates
+  distinct() %>%
+  
+  # For records with the same patient, growth parameter, and day, keep the record with the maximum value
+  group_by(patient_uuid, growth_parameter, growth_parameter_age_days) %>%
+  
+  slice_max(growth_parameter_value, with_ties = FALSE) %>%
+  
+  ungroup() %>%
+  
+  # Derivation of measurement day during follow-up
+  mutate(
+    
+    growth_parameter_measurement = "Yes",
+    
+    # Derivation of age at measurement
+    age_measurement = growth_parameter_age_days / 365.25, # age in years
+    
+    # age groups by 1-year intervals
+    annual_age_groups = cut(
+      age_measurement,  
+      breaks = c(0:12, Inf),  
+      right = FALSE,  
+      include.lowest = TRUE  
+    )
+  ) %>%
+  
+  # correct units in g to kg
+  mutate(
+      growth_parameter_value = ifelse(
+        growth_parameter_unit == "g",
+        growth_parameter_value/1000, # correct the unit to kg
+        growth_parameter_value)
+    ) %>%
+  
+  # Filter out records outside the age range 
+  filter(age_measurement < 12) %>%
+  
+  # joining gender of the patient
+  left_join(rare_disease_demographics_new, by = "patient_uuid") %>%
+  
+  mutate(sex = factor(sex)) %>%
+  
+  # keep selected columns for further processing
+  dplyr::select(
+    patient_uuid,
+    growth_parameter,
+    growth_parameter_value,
+    growth_parameter_unit,
+    growth_parameter_age_days,
+    age_measurement,
+    annual_age_groups,
+    sex,
+    growth_parameter_measurement
+  ) %>%
+  
+  # arrange by patient uuid
+  arrange(patient_uuid, growth_parameter_age_days)
+```
+
+##### Height overall
+
+```{r summary of height parameter by age group, echo=FALSE, message=FALSE, warning=FALSE}
+### CDC height for age 
+h_cdc_data <- read.csv("~/RWE-rare_disease/Age groups analyses/raw.data/statage.csv") 
+
+h_cdc <- h_cdc_data %>%
+  
+  mutate(
+    # Creating subgroups for both sexes
+    annual_age_groups = cut(
+      Agemos / 12,  
+      breaks = c(0:12, Inf),  
+      right = FALSE,  
+      include.lowest = TRUE  
+    )
+  ) %>%
+  
+  filter(annual_age_groups != "[12,Inf]") %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  summarise(
+    # Simple Median (Un-weighted)
+    p50 = round(median(P50, na.rm = TRUE), 1),
+    p05 = round(median(P5, na.rm = TRUE), 1),
+    p25 = round(median(P25, na.rm = TRUE), 1),
+    p75 = round(median(P75, na.rm = TRUE), 1),
+    p95 = round(median(P95, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+
+# summary of height parameter from RWD data
+height_gp_summary <- follow_up_patients_uuid %>%
+  
+  # adding height parameter for patients under follow up without body height records for each age group
+  left_join(filter(growth_parameters_subgrouping, growth_parameter == "Body height"), 
+            by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  mutate(
+    growth_parameter_measurement = replace_na(growth_parameter_measurement, "No")
+    ) %>%
+
+  group_by(annual_age_groups) %>%  
+  
+  # summarise by age group to compare with the CDC data
+  summarise(height_mean = round(mean(growth_parameter_value, na.rm = TRUE), 1),
+            height_sd = round(sd(growth_parameter_value, na.rm = TRUE), 1),
+            height_median = round(median(growth_parameter_value, na.rm = TRUE), 1),
+            height_25 = round(quantile(growth_parameter_value, 0.25, na.rm = TRUE), 1),
+            height_75 = round(quantile(growth_parameter_value, 0.75, na.rm = TRUE), 1),
+            .groups = 'drop') %>%
+  
+  left_join(summary_count_uuid, by = "annual_age_groups")
+
+  
+# join CDC weight data
+joined_height_data <- height_gp_summary %>%
+  
+  left_join(h_cdc, by = "annual_age_groups") %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r summary table - height parameter by age group, echo=FALSE, message=FALSE, warning=FALSE}
+# transpose table and add CDC height median
+height_gp_summary_t <- joined_height_data %>%
+  
+  mutate(
+    `Mean (sd)` = paste0(height_mean, " (", height_sd, ")"),
+    `Median [Q1-Q3]` = paste0(height_median, " [", height_25, "-", height_75, "]")
+  ) %>%
+  
+  dplyr::select(
+    annual_age_groups,
+    `Mean (sd)`, 
+    `Median [Q1-Q3]`,
+    `Participants (N)` = patients,
+    `Male (N)` = male,
+    `Female (N)` = female) %>%
+  
+  mutate(across(everything(), as.character)) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+kable(height_gp_summary_t, format = "html", caption = "Table 8. Summary of height parameter (cm) during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") %>%
+  footnote(
+    general = "Age groups defined by patient's age at measurement.",
+    general_title = "*",
+    footnote_as_chunk = TRUE)
+
+height_gp_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/height_gp_summary_table.csv")
+```
+
+```{r heigth plot, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE, dpi= 300}
+# Create the plot using percentiles (P5, P25, P50, P75, P95)
+height_plot <- ggplot(joined_height_data, aes(x = annual_age_groups)) +
+  
+  # RWD data (using height median values for the example)
+  geom_line(aes(y = height_median, group = 1, color = "RWD"), size = 0.5, linetype = "dashed") +      
+  geom_point(aes(y = height_median, color = "RWD"), size = 2) +      
+
+  # CDC data (using median of CDC percentiles)
+  geom_line(aes(y = p50, group = 1, color = "CDC"), size = 0.5, linetype = "dashed") +  
+  geom_point(aes(y = p50, color = "CDC"), size = 2) +     
+
+  # Adding ribbons for the 25th and 75th percentiles (using another color)
+  geom_ribbon(aes(ymin = p25, ymax = p75, fill = "P25–P75 (25th–75th range)", group = 2), alpha = 0.3) +
+
+  # Adding ribbons for the 5th and 95th percentiles (using a different color 
+  geom_ribbon(aes(ymin = p05, ymax = p95, fill = "P5–P95 (5th–95th range)", group = 2), alpha = 0.3) +
+  
+  # Customizing plot labels and appearance
+  labs(
+    x = "Age Group",
+    y = "Median of height (cm)",
+    color = "Source",
+    fill = "Percentile"
+  ) +
+  scale_y_continuous(breaks = seq(50, 160, 10), limits = c(50, 160)) +
+  theme_minimal() +
+  theme(
+    [BQ_REF_REDACTED] = element_blank(),        
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.position = "bottom"
+  ) +
+  scale_color_manual(values = c("RWD" = "blue", "CDC" = "red")) +
+  scale_fill_manual(values = c("P25–P75 (25th–75th range)" = "lightcoral", "P5–P95 (5th–95th range)" = "orange"))
+
+height_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/height_plot.png", 
+       height_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+###### Height by sex
+
+```{r summary of height parameter by sex, echo=TRUE, message=FALSE, warning=FALSE}
+h_cdc_sex <- h_cdc_data %>%
+  
+  mutate(
+    # Creating subgroups for both sexes
+    annual_age_groups = cut(
+      Agemos / 12,  
+      breaks = c(0:12, Inf),  
+      right = FALSE,  
+      include.lowest = TRUE  
+    )
+  ) %>%
+
+  filter(annual_age_groups != "[12,Inf]") %>%
+  
+  group_by(annual_age_groups, Sex) %>%
+  
+  # summarization of medians for each percentile
+  summarise(
+    p_50 = round(median(P50, na.rm = TRUE), 1), # or median of P50
+    p_05 = round(median(P5, na.rm = TRUE), 1),
+    p_25 = round(median(P25, na.rm = TRUE), 1),
+    p_75 = round(median(P75, na.rm = TRUE), 1),
+    p_95 = round(median(P95, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>% 
+  
+  rename(sex = Sex) %>%
+  
+  mutate(
+    sex = factor(
+      case_when(
+        sex == 1 ~ "male" ,  
+        sex == 2 ~ "female" 
+      ),
+      levels = c("male", "female")     
+    )
+  )
+
+# summary of height parameter from RWD data
+height_gp_summary_sex <- follow_up_patients_uuid %>%
+  
+  # adding height parameter for patients under follow up without body height records for each age group 
+  left_join(filter(growth_parameters_subgrouping, growth_parameter == "Body height"), 
+            by = c("patient_uuid", "annual_age_groups", "sex")) %>%
+  
+  mutate(
+    growth_parameter_measurement = replace_na(growth_parameter_measurement, "No")
+  ) %>%
+
+  group_by(annual_age_groups, sex) %>%
+  
+  # summarise by age group and sex and not by patient first due to low number of patients with height records by sex (to check here)
+  summarise(height_mean = round(mean(growth_parameter_value, na.rm = TRUE), 1),
+            height_sd = round(sd(growth_parameter_value, na.rm = TRUE), 1),
+            height_median = round(median(growth_parameter_value, na.rm = TRUE), 1),
+            height_25 = round(quantile(growth_parameter_value, 0.25, na.rm = TRUE), 1),
+            height_75 = round(quantile(growth_parameter_value, 0.75, na.rm = TRUE), 1),
+            patients = n_distinct(patient_uuid),
+            .groups = 'drop') 
+
+
+# join CDC weight data
+joined_height_sex <- left_join(
+  
+  height_gp_summary_sex, h_cdc_sex, by = c("annual_age_groups", "sex")) %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r heigth plot by sex, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE, dpi= 300}
+# Create the plot using percentiles (P5, P25, P50, P75, P95)
+height_plot_sex <- ggplot(joined_height_sex, aes(x = annual_age_groups)) +
+  
+  # RWD data (using height median values for the example)
+  geom_line(aes(y = height_median, group = 1, color = "RWD"), size = 0.5, linetype = "dashed") +      
+  geom_point(aes(y = height_median, color = "RWD"), size = 2) +      
+
+  # CDC data (using median of CDC percentiles)
+  geom_line(aes(y = p_50, group = 1, color = "CDC"), size = 0.5, linetype = "dashed") +  
+  geom_point(aes(y = p_50, color = "CDC"), size = 2) +     
+
+  # Adding ribbons for the 25th and 75th percentiles (using another color)
+  geom_ribbon(aes(ymin = p_25, ymax = p_75, fill = "P25–P75 (25th–75th range)", group = 2), alpha = 0.3) +
+
+  # Adding ribbons for the 5th and 95th percentiles (using a different color 
+  geom_ribbon(aes(ymin = p_05, ymax = p_95, fill = "P5–P95 (5th–95th range)", group = 2), alpha = 0.3) +
+  
+  # Customizing plot labels and appearance
+  labs(
+    x = "Age Group",
+    y = "Median of height (cm)",
+    color = "Source",
+    fill = "Percentile"
+  ) +
+  scale_y_continuous(breaks = seq(50, 160, 10), limits = c(50, 160)) +
+  theme_minimal() +
+  theme(
+    [BQ_REF_REDACTED] = element_blank(),        
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.position = "bottom"
+  ) +
+  scale_color_manual(values = c("RWD" = "blue", "CDC" = "red")) +
+  scale_fill_manual(values = c("P25–P75 (25th–75th range)" = "lightcoral", "P5–P95 (5th–95th range)" = "orange")) +
+  
+  facet_wrap(~ sex)
+
+height_plot_sex
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/height_plot_by_sex.png", 
+       height_plot_sex, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+##### Weight
+
+```{r summary of weight parameter by age group, echo=TRUE, message=FALSE, warning=FALSE}
+### CDC weight for age
+w_cdc_data <- read.csv("~/RWE-rare_disease/Age groups analyses/raw.data/wtage.csv") 
+
+w_cdc <- w_cdc_data %>%
+  
+  mutate(
+    # Creating subgroups for both sexes
+    annual_age_groups = cut(
+      Agemos / 12,  
+      breaks = c(0:12, Inf),  
+      right = FALSE,  
+      include.lowest = TRUE  
+    )
+  ) %>%
+
+  filter(annual_age_groups != "[12,Inf]") %>%
+  
+  group_by(annual_age_groups) %>%
+
+  summarise(
+    p_50 = round(median(P50, na.rm = TRUE), 1),
+    p_05 = round(median(P5, na.rm = TRUE), 1),
+    p_25 = round(median(P25, na.rm = TRUE), 1),
+    p_75 = round(median(P75, na.rm = TRUE), 1),
+    p_95 = round(median(P95, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+# summary of weight parameter from RWD data
+weight_gp_summary <- follow_up_patients_uuid %>%
+  
+  # adding height parameter for patients under follow up without body height records for each age group
+  left_join(filter(growth_parameters_subgrouping, growth_parameter == "Body weight"), 
+            by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  mutate(
+    growth_parameter_measurement = replace_na(growth_parameter_measurement, "No")
+    ) %>%  
+
+  group_by(annual_age_groups) %>%
+  
+  summarise(weight_mean = round(mean(growth_parameter_value, na.rm = TRUE), 1),
+            weight_sd = round(sd(growth_parameter_value, na.rm = TRUE), 1),
+            weight_median = round(median(growth_parameter_value, na.rm = TRUE), 1),
+            weight_25 = round(quantile(growth_parameter_value, 0.25, na.rm = TRUE), 1),
+            weight_75 = round(quantile(growth_parameter_value, 0.75, na.rm = TRUE), 1),
+            .groups = 'drop') %>%
+  
+  left_join(summary_count_uuid, by = "annual_age_groups")
+
+
+# join CDC weight data
+joined_weight_data <- weight_gp_summary %>%
+  
+  left_join(w_cdc, by = "annual_age_groups") %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r summary table - weight parameter by age group, echo=TRUE, message=FALSE, warning=FALSE}
+# summary both in transpose table
+weight_gp_summary_t <- joined_weight_data %>%
+  
+  mutate(
+    `Mean (sd)` = paste0(weight_mean, " (", weight_sd, ")"),
+    `Median [Q1-Q3]` = paste0(weight_median, " [", weight_25, "-", weight_75, "]")
+  ) %>%
+  
+  dplyr::select(
+    annual_age_groups, 
+    `Mean (sd)`,
+    `Median [Q1-Q3]`,
+    `Patients (N)` = patients,
+    `Male (N)` = male,
+    `Female (N)` = female) %>%
+  
+  mutate(across(everything(), as.character)) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value)
+
+kable(weight_gp_summary_t, format = "html", caption = "Table 8. Summary of weight parameter (kg) during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") %>%
+  footnote(
+    general = "Age groups defined by patient's age at measurement.",
+    general_title = "*",
+    footnote_as_chunk = TRUE)
+
+weight_gp_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/weight_gp_summary_table.csv")
+```
+
+```{r weigth plot, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE,  dpi = 300}
+# Create the plot using percentiles (P5, P25, P50, P75, P95)
+weight_plot <- ggplot(joined_weight_data, aes(x = annual_age_groups)) +
+  
+  # RWD data (using height median values for the example)
+  geom_line(aes(y = weight_median, group = 1, color = "RWD"), size = 0.5, linetype = "dashed") +      
+  geom_point(aes(y = weight_median, color = "RWD"), size = 2) +      
+
+  # CDC data (using median of CDC percentiles)
+  geom_line(aes(y = p_50, group = 1, color = "CDC"), size = 0.5, linetype = "dashed") +  
+  geom_point(aes(y = p_50, color = "CDC"), size = 2) +     
+
+  # Adding ribbons for the 25th and 75th percentiles (using another color)
+  geom_ribbon(aes(ymin = p_25, ymax = p_75, fill = "P25–P75 (25th–75th range)", group = 2), alpha = 0.3) +
+
+  # Adding ribbons for the 5th and 95th percentiles (using a different color 
+  geom_ribbon(aes(ymin = p_05, ymax = p_95, fill = "P5–P95 (5th–95th range)", group = 2), alpha = 0.3) +
+  
+  # Customizing plot labels and appearance
+  labs(
+    x = "Age Group",
+    y = "Median of weight (kg)",
+    color = "Source",
+    fill = "Percentile"
+  ) +
+  scale_y_continuous(breaks = seq(0, 60, 10), limits = c(0, 60)) +
+  theme_minimal() +
+  theme(
+    [BQ_REF_REDACTED] = element_blank(),        
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.position = "bottom"
+  ) +
+  scale_color_manual(values = c("RWD" = "blue", "CDC" = "red")) +
+  scale_fill_manual(values = c("P25–P75 (25th–75th range)" = "lightcoral","P5–P95 (5th–95th range)" = "orange"))
+
+weight_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/weight_plot.png", 
+       weight_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+###### Weight by sex
+
+```{r summary of weight parameter by sex, echo=TRUE, message=FALSE, warning=FALSE}
+w_cdc_sex <- w_cdc_data %>%
+  
+  mutate(
+    # Creating subgroups for both sexes
+    annual_age_groups = cut(
+      Agemos / 12,  
+      breaks = c(0:12, Inf),  
+      right = FALSE,  
+      include.lowest = TRUE  
+    )
+  ) %>%
+
+  filter(annual_age_groups != "[12,Inf]") %>%
+  
+  group_by(annual_age_groups, Sex) %>%
+  
+  summarise(
+    p_50 = round(median(P50, na.rm = TRUE), 1),
+    p_05 = round(median(P5, na.rm = TRUE), 1),
+    p_25 = round(median(P25, na.rm = TRUE), 1),
+    p_75 = round(median(P75, na.rm = TRUE), 1),
+    p_95 = round(median(P95, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>% 
+  
+  rename(sex = Sex) %>%
+  
+  mutate(
+    sex = factor(
+      case_when(
+        sex == 1 ~ "male" ,  
+        sex == 2 ~ "female" 
+      ),
+      levels = c("male", "female")     
+    )
+  )
+
+
+# summary of height parameter from RWD data
+weight_gp_summary_sex <- follow_up_patients_uuid %>%
+  
+  # adding height parameter for patients under follow up without body height records for each age group 
+  left_join(filter(growth_parameters_subgrouping, growth_parameter == "Body weight"), 
+            by = c("patient_uuid", "annual_age_groups", "sex")) %>%
+  
+  mutate(
+    growth_parameter_measurement = replace_na(growth_parameter_measurement, "No")
+  ) %>%
+  
+  group_by(annual_age_groups, sex) %>%  
+  
+  summarise(weight_mean = round(mean(growth_parameter_value, na.rm = TRUE), 1),
+            weight_sd = round(sd(growth_parameter_value, na.rm = TRUE), 1),
+            weight_median = round(median(growth_parameter_value, na.rm = TRUE), 1),
+            weight_25 = round(quantile(growth_parameter_value, 0.25, na.rm = TRUE), 1),
+            weight_75 = round(quantile(growth_parameter_value, 0.75, na.rm = TRUE), 1),
+            weight_min = round(min(growth_parameter_value, na.rm = TRUE), 1),
+            weight_max = round(max(growth_parameter_value, na.rm = TRUE), 1),
+            .groups = 'drop')
+
+  
+# join CDC weight data
+joined_weight_sex <- left_join(
+  
+  weight_gp_summary_sex, w_cdc_sex, by = c("annual_age_groups", "sex")) %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r weigth plot by sex, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE, dpi= 300}
+# Create the plot using percentiles (P5, P25, P50, P75, P95)
+weight_plot_sex <- ggplot(joined_weight_sex, aes(x = annual_age_groups)) +
+  
+  # RWD data (using height median values for the example)
+  geom_line(aes(y = weight_median, group = 1, color = "RWD"), size = 0.5, linetype = "dashed") +      
+  geom_point(aes(y = weight_median, color = "RWD"), size = 2) +      
+
+  # CDC data (using median of CDC percentiles)
+  geom_line(aes(y = p_50, group = 1, color = "CDC"), size = 0.5, linetype = "dashed") +  
+  geom_point(aes(y = p_50, color = "CDC"), size = 2) +     
+
+  # Adding ribbons for the 25th and 75th percentiles (using another color)
+  geom_ribbon(aes(ymin = p_25, ymax = p_75, fill = "P25–P75 (25th–75th range)", group = 2), alpha = 0.3) +
+
+  # Adding ribbons for the 5th and 95th percentiles (using a different color 
+  geom_ribbon(aes(ymin = p_05, ymax = p_95, fill = "P5–P95 (5th–95th range)", group = 2), alpha = 0.3) +
+  
+  # Customizing plot labels and appearance
+  labs(
+    x = "Age Group",
+    y = "Median of weight (kg)",
+    color = "Source",
+    fill = "Percentile"
+  ) +
+  scale_y_continuous(breaks = seq(0, 60, 10), limits = c(0, 60)) +
+  theme_minimal() +
+  theme(
+    [BQ_REF_REDACTED] = element_blank(),        
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.position = "bottom"
+  ) +
+  scale_color_manual(values = c("RWD" = "blue", "CDC" = "red")) +
+  scale_fill_manual(values = c("P25–P75 (25th–75th range)" = "lightcoral", "P5–P95 (5th–95th range)" = "orange")) +
+  
+  facet_wrap(~ sex) 
+
+weight_plot_sex
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/weight_plot_by_sex.png", 
+       weight_plot_sex, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+##### Head circumference
+
+```{r summary of head circumference parameter by age group, echo=TRUE, message=FALSE, warning=FALSE}
+### WHO head circumference until 5 years old
+hc_who_data <- read.csv("~/RWE-rare_disease/Age groups analyses/raw.data/tab_hcfa_girls_boys_p_0_5.csv") 
+
+hc_who <- hc_who_data %>%
+  mutate(
+    # Creating subgroups for both sexes
+    annual_age_groups = cut(
+      Month / 12,  
+      breaks = c(0:5, Inf),  
+      right = FALSE,  
+      include.lowest = TRUE  
+    )
+  ) %>%
+
+  filter(annual_age_groups != "[5,Inf]") %>%
+  
+  group_by(annual_age_groups) %>%
+  
+  summarise(
+    p_50 = round(median(P50, na.rm = TRUE), 1), # Median of WHO percentiles
+    p_05 = round(median(P5, na.rm = TRUE), 1),
+    p_25 = round(median(P25, na.rm = TRUE), 1),
+    p_75 = round(median(P75, na.rm = TRUE), 1),
+    p_95 = round(median(P95, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+# summary of head circumference parameter from RWD data
+head_circum_gp_summary <- follow_up_patients_uuid %>%
+  
+  # adding height parameter for patients under follow up without body height records for each age group
+  left_join(filter(growth_parameters_subgrouping, growth_parameter == "Head circumference"), 
+            by = c("patient_uuid", "annual_age_groups")) %>%
+  
+  mutate(
+    growth_parameter_measurement = replace_na(growth_parameter_measurement, "No")
+    ) %>% 
+  
+  group_by(annual_age_groups) %>%
+  
+  summarise(head_circum_mean = round(mean(growth_parameter_value, na.rm = TRUE), 1),
+            head_circum_sd = round(sd(growth_parameter_value, na.rm = TRUE), 1),
+            head_circum_median = round(median(growth_parameter_value, na.rm = TRUE), 1),
+            head_circum_25 = round(quantile(growth_parameter_value, 0.25, na.rm = TRUE), 1),
+            head_circum_75 = round(quantile(growth_parameter_value, 0.75, na.rm = TRUE), 1),
+            .groups = 'drop') %>%
+  
+  left_join(summary_count_uuid, by = "annual_age_groups")
+
+# join WHO head circumference data
+joined_hc_data <- head_circum_gp_summary %>%
+  
+  left_join(hc_who, by = "annual_age_groups") %>%
+
+  arrange(annual_age_groups)
+```
+
+```{r summary table - head circumference parameter by age group, echo=TRUE, message=FALSE, warning=FALSE}
+# transpose table
+head_circum_gp_summary_t <- head_circum_gp_summary %>%
+  
+  mutate(
+    `Mean (sd)` = paste0(head_circum_mean, " (", head_circum_sd, ")"),
+    `Median, [Q1-Q3]` = paste0(head_circum_median, " [", head_circum_25, "-", head_circum_75, "]")
+  ) %>%
+  
+  dplyr::select(
+    annual_age_groups,
+    `Mean (sd)`,
+    `Median, [Q1-Q3]`,
+    `Patients (N)` = patients,
+    `Male (N)` = male,
+    `Female (N)` = female) %>%
+  
+  mutate(across(everything(), as.character)) %>%
+  
+  pivot_longer(cols = -annual_age_groups, names_to = "Metric", values_to = "Value") %>%
+  
+  pivot_wider(names_from = annual_age_groups, values_from = Value) 
+
+kable(head_circum_gp_summary_t, format = "html", caption = "Table 9. Summary of head circumference (cm) parameter during follow-up by age groups") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") %>%
+  footnote(
+    general = "Age groups defined by patient's age at measurement.",
+    general_title = "*",
+    footnote_as_chunk = TRUE)
+
+head_circum_gp_summary_t %>%
+  write_csv("~/RWE-rare_disease/Age groups analyses/output/tables/head_circum_gp_summary_table.csv")
+```
+
+```{r head circumference plot, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE,  dpi = 300}
+# Create the plot using percentiles (P5, P25, P50, P75, P95)
+head_circum_plot <- ggplot(joined_hc_data, aes(x = annual_age_groups)) +
+  
+  # RWD data (using height median values for the example)
+  geom_line(aes(y = head_circum_median, group = 1, color = "RWD"), size = 0.5, linetype = "dashed") +      
+  geom_point(aes(y = head_circum_median, color = "RWD"), size = 2) +      
+
+  # CDC data (using median of CDC percentiles)
+  geom_line(aes(y = p_50, group = 1, color = "WHO"), size = 0.5, linetype = "dashed") +  
+  geom_point(aes(y = p_50, color = "WHO"), size = 2) +     
+
+  # Adding ribbons for the 25th and 75th percentiles (using another color)
+  geom_ribbon(aes(ymin = p_25, ymax = p_75, fill = "P25–P75 (25th–75th range)", group = 2), alpha = 0.3) +
+
+  # Adding ribbons for the 5th and 95th percentiles (using a different color 
+  geom_ribbon(aes(ymin = p_05, ymax = p_95, fill = "P5–P95 (5th–95th range)", group = 2), alpha = 0.3) +
+  
+  # Customizing plot labels and appearance
+  labs(
+    x = "Age Group",
+    y = "Median of head circumference (cm)",
+    color = "Source",
+    fill = "Percentile"
+  ) +
+  scale_y_continuous(breaks = seq(30, 60, 5), limits = c(30, 60)) +
+  theme_minimal() +
+  theme(
+    [BQ_REF_REDACTED] = element_blank(),        
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.position = "bottom"
+  ) +
+  scale_color_manual(values = c("RWD" = "blue", "WHO" = "red")) +
+  scale_fill_manual(values = c("P25–P75 (25th–75th range)" = "lightcoral", "P5–P95 (5th–95th range)" = "orange"))
+
+head_circum_plot
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/head.[BQ_REF_REDACTED]", 
+       head_circum_plot, units = "mm", width = 200, height = 150 , dpi = 300)
+```
+
+###### Head circumference by sex
+
+```{r summary of head circumference parameter by sex, echo=TRUE, message=FALSE, warning=FALSE}
+### WHO head circumference until 5 years old
+hc_who_sex <- hc_who_data %>%
+  mutate(
+    # Creating subgroups for both sexes
+    annual_age_groups = cut(
+      Month / 12,  
+      breaks = c(0:5, Inf),  
+      right = FALSE,  
+      include.lowest = TRUE  
+    )
+  ) %>%
+
+  filter(annual_age_groups != "[5,Inf]") %>%
+  
+  group_by(annual_age_groups, L) %>%
+  
+  summarise(
+    p_50 = round(median(P50, na.rm = TRUE), 1), # Median of WHO percentiles
+    p_05 = round(median(P5, na.rm = TRUE), 1),
+    p_25 = round(median(P25, na.rm = TRUE), 1),
+    p_75 = round(median(P75, na.rm = TRUE), 1),
+    p_95 = round(median(P95, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  
+  rename(sex = L) %>%
+  
+  mutate(
+    sex = factor(
+      case_when(
+        sex == 1 ~ "male" ,  
+        sex == 2 ~ "female" 
+      ),
+      levels = c("male", "female")     
+    )
+  )
+
+# summary of head circumference parameter from RWD data
+head_circum_gp_summary.sex <- follow_up_patients_uuid %>%
+  
+  # adding height parameter for patients under follow up without body height records for each age group 
+  left_join(filter(growth_parameters_subgrouping, growth_parameter == "Head circumference"), 
+            by = c("patient_uuid", "annual_age_groups", "sex")) %>%
+  
+  mutate(
+    growth_parameter_measurement = replace_na(growth_parameter_measurement, "No")
+  ) %>%
+
+  group_by(annual_age_groups, sex) %>%  
+  
+  summarise(head_circum_mean = round(mean(growth_parameter_value, na.rm = TRUE), 1),
+            head_circum_sd = round(sd(growth_parameter_value, na.rm = TRUE), 1),
+            head_circum_median = round(median(growth_parameter_value, na.rm = TRUE), 1),
+            head_circum_25 = round(quantile(growth_parameter_value, 0.25, na.rm = TRUE), 1),
+            head_circum_75 = round(quantile(growth_parameter_value, 0.75, na.rm = TRUE), 1),
+            .groups = 'drop') 
+
+
+# join WHO head circumference data
+joined_hc_data_sex <- left_join(
+  head_circum_gp_summary.sex, hc_who_sex, by = c("annual_age_groups", "sex")) %>%
+  
+  arrange(annual_age_groups)
+```
+
+```{r head circumference plot by sex, echo=FALSE, fig.align='center', message=FALSE, warning=FALSE,  dpi = 300}
+# Create the plot using percentiles (P5, P25, P50, P75, P95)
+head_circum_plot_sex <- ggplot(joined_hc_data_sex, aes(x = annual_age_groups)) +
+  
+  # RWD data (using height median values for the example)
+  geom_line(aes(y = head_circum_median, group = 1, color = "RWD"), size = 0.5, linetype = "dashed") +      
+  geom_point(aes(y = head_circum_median, color = "RWD"), size = 2) +      
+
+  # CDC data (using median of CDC percentiles)
+  geom_line(aes(y = p_50, group = 1, color = "WHO"), size = 0.5, linetype = "dashed") +  
+  geom_point(aes(y = p_50, color = "WHO"), size = 2) +     
+
+  # Adding ribbons for the 25th and 75th percentiles (using another color)
+  geom_ribbon(aes(ymin = p_25, ymax = p_75, fill = "P25–P75 (25th–75th range)", group = 2), alpha = 0.3) +
+
+  # Adding ribbons for the 5th and 95th percentiles (using a different color 
+  geom_ribbon(aes(ymin = p_05, ymax = p_95, fill = "P5–P95 (5th–95th range)", group = 2), alpha = 0.3) +
+  
+  # Customizing plot labels and appearance
+  labs(
+    x = "Age Group",
+    y = "Median of head circumference (cm)",
+    color = "Source",
+    fill = "Percentile"
+  ) +
+  scale_y_continuous(breaks = seq(30, 60, 5), limits = c(30, 60)) +
+  theme_minimal() +
+  theme(
+    [BQ_REF_REDACTED] = element_blank(),       
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.position = "bottom"
+  ) +
+  scale_color_manual(values = c("RWD" = "blue", "WHO" = "red")) +
+  scale_fill_manual(values = c("P25–P75 (25th–75th range)" = "lightcoral", "P5–P95 (5th–95th range)" = "orange")) + 
+  
+  facet_wrap(~ sex)
+
+head_circum_plot_sex
+
+ggsave("~/RWE-rare_disease/Age groups analyses/output/plots/head.[BQ_REF_REDACTED].sex.png", 
+       head_circum_plot_sex, units = "mm", width = 200, height = 150 , dpi = 300)
+```
