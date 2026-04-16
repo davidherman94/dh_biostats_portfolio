@@ -1,0 +1,4520 @@
+---
+title: "Modeling workflow and endpoint definition (portfolio example)"
+subtitle: "Endpoint derivation and modeling pipeline"
+author: "David Herman"
+    reference-doc: custom-reference-doc.docx
+---
+
+# Introduction
+
+## Background
+Background text
+
+## Objective
+Objective
+
+## Endpoint
+Endpoint definition
+
+```{r setup, echo = F}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+options(knitr.kable.NA = "")
+```
+
+```{r}
+#| label: load-functions-config-files
+#| echo: false
+#| warning: false
+
+# Import config file with list of defined variables
+source("../src/config.R") 
+# Import developed functions 
+source("../src/functions.R")
+```
+
+```{r}
+#| label: load-packages
+#| echo: false
+#| warning: false
+#| message: false
+#| error: false
+#| cache: false
+#| include: false
+load_libraries(PACKAGES)
+```
+
+```{r}
+#| label: client-authentification
+#| echo: false
+#| warning: false
+#| message: false
+# do not displayed
+```
+
+```{r}
+#| label: importing_derived_dfs
+#| echo: false
+#| warning: false
+#| message: false
+
+# derived dataframes can be consulted in the data management file.
+#' dataframe for main all analyses
+hospitalization_main_df_nb <- gcs_get_object(
+  "",
+  bucket = "",
+  parseFunction = gcs_parse_rds)
+
+# df for sensitivity analyses of merging admissions ocurred on the same day
+hospitalizations_merged_same_day_df <- gcs_get_object(
+  "",
+  bucket = "",
+  parseFunction = gcs_parse_rds)
+
+# df for sensitivity analyses of merging admissions ocurred on the next day
+hospitalizations_merged_next_day_df <- gcs_get_object(
+  "",
+  bucket = "",
+  parseFunction = gcs_parse_rds)
+```
+
+```{r}
+#| label: fig-outcome-derivation-plot
+#| fig-cap: "Illustration of 30-day readmissions derivation for a patient with four hospital admissions during the entire follow-up period (from day 1 to day 80). The patient had an index discharge on day 39 (i.e., first admission event) and then experienced subsequent hospital admissions on days 44, 54, and 69, respectively. According to the followed definition, all subsequent admissions are counted (n = 3) for the given index admission as they fall within the same 30-day window. Following this 30-day window, any subsequent hospital admission is considered a  new (second) index admission with its respective 30-day windows initiate."
+#| echo: false
+#| warning: false
+#| fig-align: center
+#| out-width: 100%
+
+fig_outcome_derivation <- hospitalization_main_df_nb %>%
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    readmission,
+    first_record_age_days,
+    last_record_age_days
+  ) %>%
+  distinct() %>%
+  ungroup() %>%
+  # Filter for a specific patient with 3 subsequent admissions within 30 days
+  filter(patient_uuid == "patient_id_number") %>%
+  # Filter out admissions which are not index or 30-day UHRs
+  filter(!is.na(readmission)) %>%
+  mutate(
+    patient_label = "Patient example",
+    followup_duration = last_record_age_days - first_record_age_days
+  ) %>%
+  mutate(
+    # Identify last index discharge
+    last_index_discharge = if_else(readmission == "index", 
+                                   admission_age_days_lastDate, NA_real_),
+    last_index_discharge = zoo::na.locf(last_index_discharge, na.rm = FALSE),
+    time_diff = admission_age_days_firstDate - last_index_discharge
+  ) %>%
+  mutate(
+    readmission_label = case_when(
+      readmission == "index" ~ "Index discharge day",
+      str_detect(readmission, "30_days_uhr") ~ "30-day UHRs",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ggplot(.) +
+  scale_alpha_manual(name = "", values = 1) +
+  geom_linerange(
+    aes(y = patient_label, xmin = 1, xmax = 80),
+    linetype = "dashed",
+    size = .2,
+  ) +
+
+  # Add horizontal line to refer to the 30-window after index discharge
+  geom_segment(aes(x = 39, xend = 69, y = 1.05, yend = 1.05),
+    color = "black", size = 0.2
+  ) +
+
+  # Add left arrow at x = 39
+  geom_segment(aes(x = 39, xend = 36, y = 1.05, yend = 1.05),
+    color = "black", size = 0.2,
+    arrow = arrow(type = "closed", length = unit(0.2, "cm"))
+  ) +
+
+  # Add right arrow at x = 69
+  geom_segment(aes(x = 66, xend = 69, y = 1.05, yend = 1.05),
+    color = "black", size = 0.2,
+    arrow = arrow(type = "closed", length = unit(0.2, "cm"))
+  ) +
+
+  # Add label above the line
+  annotate("text",
+    x = 52, y = 1.1, label = "30-day window after index discharge (day 39)",
+    size = 3
+  ) +
+  geom_point(
+    aes(
+      x = admission_age_days_firstDate,
+      y = patient_label,
+      colour = factor(readmission_label)
+    ),
+    shape = 18,
+    size = 5,
+    show.legend = TRUE
+  ) +
+  geom_text(
+    aes(
+      x = admission_age_days_firstDate,
+      y = patient_label,
+      label = case_when(readmission_label == "30-day UHRs" ~ as.character(paste0(
+        "day ", abs(admission_age_days_firstDate)
+      )))
+    ),
+    size = 2.7,
+    hjust = 0.5,
+    vjust = -1,
+    nudge_y = -0.08
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Index discharge day" = "red",
+      "30-day UHRs" = "blue"
+    ),
+    labels = c(
+      "Index discharge day" = "Index admission",
+      "30-day UHRs" = "30-day UHRs"
+    ),
+    name = "Hospitalization type"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 80, 5),
+    limits = c(0, 80)
+  ) +
+  labs(x = "Follow-up time (days)") +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    axis.text.x = element_text(size = 7),
+    axis.text.y = element_text(size = 7, face = "bold", margin = margin(r = -18)),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_blank(),
+    legend.title = element_text(size = 9),
+    legend.position = "bottom",
+    legend.text = element_text(size = 9)
+  )
+
+fig_outcome_derivation
+```
+
+# Descriptive analysis
+
+```{r}
+#| label: readmissions-data-selection
+#| echo: false
+#| warning: false
+
+# Select, order and rename variables for readmission df
+#' Note: readmission variable used to filter the desired subset of data
+#' was derived in the data management file
+readmissions_df <- hospitalization_main_df_nb %>%
+  #' keep index with valid exptime and remove those with invalid index 
+  #' admission which doens't allow to count readmissions (i.e. exptime == 0)
+  #' Index derived in the data management file already excludes planned, birth
+  #'  and outpatient admissions
+  filter(readmission == "index" & !is.na(count_readmissions)) %>%
+  # order, rename and select variables of interest
+  dplyr::select(
+    # patient identifier
+    patient_uuid,
+    # admissions related features
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    # demographics
+    sex,
+    age_index_admission_yr = age_admission_yr,
+    # genetic mutations
+    other_epilepsy_mutations,
+    recurrent_variant,
+    neonatal_onset,
+    # clinical history
+    seizure_related_index_admission = seizure_related_admission,
+    length_of_index_stay_days_cat = length_of_stay_days_cat,
+    respiratory_support_index_admission = respiratory_support_admission,
+    tech_assistance_ever,
+    count_readmissions,
+    exptime,
+    # treatment history
+    vns_insertion_ever,
+    n_distinct_asm_index_admission = n_distinct_asm_admission,
+    adverse_effect_index_admission = adverse_effect_admission,
+    ketogenic_diet_admission,
+    quinidine_admission
+    )
+```
+
+## Distribution of 30-day UHRs per patient
+
+### Proportion of patients with at least one index admission and one 30-day UHR
+
+```{r}
+#| label: tbl-descriptive-proportions-30-day-endpoint
+#| tbl-cap: "Proportion of patients with at least one index admission and with at least one 30-day UHRs over total follow-up period"
+#| echo: false
+#| results: 'markup'
+
+# percentage of patients with at least one 30-day UHR event
+uhr_proportions <- readmissions_df %>%
+  summarise(
+    total_RWD_patients = 50,
+    total_patients_with_index = n_distinct(patient_uuid),
+    prop_with_index = round(total_patients_with_index / total_RWD_patients * 100, 1),
+    total_patients_with_uhr = n_distinct(patient_uuid[which(count_readmissions >= 1)]),
+    prop_with_uhr = round(total_patients_with_uhr / total_patients_with_index * 100, 1)
+  ) 
+
+uhr_prop_summary_table <- tibble(
+  Statistic = c(
+    "At least one index admission¹", 
+    "At least one 30-day UHR²"
+  ),
+  'N patients (%)' = c(
+    sprintf("%d (%.1f)", round(uhr_proportions$total_patients_with_index, 1), round(uhr_proportions$prop_with_index, 1)),
+    sprintf("%d (%.1f)", round(uhr_proportions$total_patients_with_uhr, 1), round(uhr_proportions$prop_with_uhr, 1))
+  )
+)
+
+uhr_prop_summary_table %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%  
+  flextable::add_footer_lines(
+    values = c(
+      "¹ Percentage relative to total RWD patients (N = 50).",
+      "² Percentage relative to patients with at least one index admission (N = 48).",
+      "Note: For patients without index admissions. a) patient with only a single hospital admission, which was not classified as an index admission because the discharge date coincided with the last day of follow-up. This left no post-discharge time at risk for a 30-day UHR; b) patient without hospitalization events (loss to follow-up at day 196)."
+    )
+  )  %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) 
+```
+
+### Number of UHRs
+
+```{r}
+#| label: tbl-descriptive-number-per-patient-30-day-endpoint
+#| tbl-cap: "Number of 30-day UHRs per patient over follow-up period"
+#| echo: false
+#| results: 'markup'
+
+# total 30-day UHRs for each patient over follow up
+uhr_by_patient <- readmissions_df %>%
+  group_by(patient_uuid) %>%
+  summarise(
+    # sum of 30-day UHRs per patient during follow-up
+    patient_readmissions = sum(count_readmissions, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# summary across patients
+uhr_by_across_patient <- uhr_by_patient %>%
+  summarise(
+    # mean (average) number of UHRs per patient
+    mean_uhr = mean(patient_readmissions, na.rm = TRUE),
+    # standard deviation of UHRs per patient
+    sd_uhr = sd(patient_readmissions),
+    # median (50th percentile) number of UHRs per patient
+    median_uhr = median(patient_readmissions),
+    # minimum number of UHRs observed
+    min_uhr = min(patient_readmissions),
+    # maximum number of UHRs observed
+    max_uhr = max(patient_readmissions),
+    # 25th percentile (Q1) of UHRs per patient
+    q25_uhr = quantile(patient_readmissions, 0.25),
+    # 75th percentile (Q3) of UHRs per patient
+    q75_uhr = quantile(patient_readmissions, 0.75)
+  )
+
+uhr_summary_table <- tibble(
+  'Summary statistic' = c(
+    "Mean UHRs (SD)",
+    "Median UHRs (Q1–Q3)",
+    "Range UHRs (min–max)"
+  ),
+  '30-day UHRs per patient' = c(
+    sprintf("%.1f (%.1f)", uhr_by_across_patient$mean_uhr, uhr_by_across_patient$sd_uhr),
+    sprintf("%.1f (%.1f–%.1f)", uhr_by_across_patient$median_uhr, uhr_by_across_patient$q25_uhr, uhr_by_across_patient$q75_uhr),
+    sprintf("%.1f–%.1f", uhr_by_across_patient$min_uhr, uhr_by_across_patient$max_uhr)
+  )
+)
+
+uhr_summary_table %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>% 
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(
+    values = c(
+      "Note 1: average follow-up time: 5.4 years.",
+      "Note 2: for each patient, the total number of 30-day UHRs was summed over the follow-up period, and summary statistics were calculated from these patient-level totals across patients.",
+      "Note 3: summary statistics were calculated from patients with at least one index admission (N = 48)."
+    )
+  )  %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9)
+```
+
+### Maximum number of 30-day UHRs
+
+```{r}
+#| label: tbl-descriptive-30-dayUHR-distribution
+#| tbl-cap: "Maximum of 30-day UHRs per patient experienced during follow-up"
+#| echo: false
+#| results: 'markup'
+
+readmission_distribution <- uhr_by_patient %>%
+  group_by(patient_readmissions) %>%
+  summarise(count = n()) %>%
+  mutate(
+    proportion = count / sum(count) * 100,
+    Value = sprintf("%d (%.1f%%)", count, proportion)
+  )
+
+readmission_distribution %>%
+  dplyr::rename(
+    "Maximum number of 30-day UHRs" = patient_readmissions,
+    "N patients (%)¹" = Value
+  ) %>%
+  dplyr::select(`Maximum number of 30-day UHRs`, `N patients (%)¹`) %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>% 
+  flextable::add_footer_lines(
+    values = c(
+      "¹ Percentage relative to patients with at least one index admission (N = 48).",
+      "Note: Average follow-up time: 5.4 years."
+    )
+  ) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::fontsize(part = "footer", size = 9) %>%  
+  flextable::align(j = 1, align = "left", part = "all") %>%  
+  flextable::align(j = 2, align = "right", part = "all")
+```
+
+## Number of 30-day UHRs events across patient’s age
+
+```{r}
+#| label: fig-30-day-readmissions-year-df
+#| echo: false
+#| warning: false
+
+# prepare data for plotting readmissions by year of age
+readmissions_by_years <- readmissions_df %>%
+  # flag the year in which the admission has occurred based on admission start
+  mutate(age_years = floor(admission_age_days_firstDate / 365.25)) %>%
+  # group by patient and year to get the count per patient per year
+  group_by(patient_uuid, age_years) %>%
+  summarise(
+    readmissions = sum(count_readmissions),
+    .groups = "drop"
+  ) %>%
+  # group by year to get the summary across patients per year
+  group_by(age_years) %>%
+  summarise(
+    mean_readmissions = mean(readmissions, na.rm = TRUE),
+    median_readmissions = median(readmissions, na.rm = TRUE),
+  ) %>%
+  mutate(
+    age_years = cut(
+      age_years,
+      breaks = c(0:21, Inf),
+      right = FALSE,
+      include.lowest = TRUE
+    )
+  )
+
+# Extract the unique patient_uuid under follow up by age group
+# Note: this was obtained from reviewed code from IND submission with subgrouping analysis.
+follow_up_patients_uuid <- hospitalization_main_df_nb %>%
+  # remove invalid index admissions (2 records)
+  filter(!(readmission == "index" & is.na(count_readmissions))) %>%
+  group_by(patient_uuid) %>%
+  reframe(
+    age_range = seq(
+      floor(min(first_record_age_days, na.rm = TRUE) / 365.25),
+      floor(max(last_record_age_days, na.rm = TRUE) / 365.25)
+    )
+  ) %>%
+  # remove ages > 20 years to compare with graph of 30-day outcome
+  filter(age_range <= 20) %>% 
+  mutate(
+    age_years = cut(
+      age_range,
+      breaks = c(0:21, Inf),
+      right = FALSE,
+      include.lowest = TRUE
+    )
+  ) %>%
+  dplyr::select(-age_range) %>%
+  group_by(age_years) %>%
+  reframe(n = n_distinct(patient_uuid))
+```
+
+```{r}
+#| label: fig-30-day-readmissions-year-mean
+#| fig-cap: "Mean number of 30-day UHRs per patient by year^[Number of 30-day UHRs were summed per patient within each age interval, and means were computed across patients for each interval.]"
+#| echo: false
+#| warning: false
+
+fig_readmissions_by_years_mean <-  ggplot() + 
+  
+  geom_col( 
+    data = follow_up_patients_uuid,
+    aes(x = age_years, 
+      y = n * (1.5/50), 
+      fill = "Number of patients with at least one index admission during follow-up"),  
+    colour = "grey40",  
+    linetype = "dotted",
+    width = 0.9, 
+    alpha = 0.4           
+    ) +
+  
+  scale_fill_manual(values = c("Number of patients with at least one index admission during follow-up" = "grey80"), name = NULL) +
+  
+  # Patient counts as text labels
+  geom_text(
+  data = follow_up_patients_uuid,
+  aes(x = age_years,
+      y = n * (1.5/50) + 0.05,   # move text up a bit relative to shorter bars
+      label = paste0("n = ", n)),
+  size = 2.5, vjust = 0
+  )+
+  
+  # Mean readmissions 
+  geom_line(
+    data = readmissions_by_years,
+    aes(x = age_years, y = mean_readmissions, group = 1),
+    colour = "black"
+  ) +
+  geom_point(
+    data = readmissions_by_years,
+    aes(x = age_years, y = mean_readmissions),
+    colour = "black"
+  ) +
+  
+  scale_y_continuous(
+    name = "Mean number of 30-day UHRs per patient",
+    limits = c(0, 3), breaks = seq(0, 3, 1)
+  ) +
+  labs(x = "Patient's age at admission (years)") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 9, face = "bold", angle = 45, hjust = 1),
+    axis.text.y  = element_text(size = 9, face = "bold"),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    plot.title   = element_text(hjust = 0),
+    legend.position = "bottom"
+  )
+
+fig_readmissions_by_years_mean
+```
+
+```{r}
+#| label: fig-30-day-readmissions-year-median
+#| fig-cap: "Median number of 30-day UHRs per patient by year^[Number of 30-day UHRs were summed per patient within each age interval, and medians were computed across patients for each interval.]"
+#| echo: false
+#| warning: false
+
+fig_readmissions_by_years_median <-  ggplot() + 
+  
+  geom_col( 
+    data = follow_up_patients_uuid,
+    aes(x = age_years, 
+      y = n * (1.5/50), 
+      fill = "Number of patients with at least one index admission during follow-up"),  
+    colour = "grey40",  
+    linetype = "dotted",
+    width = 0.9, 
+    alpha = 0.4           
+    ) +
+  
+  scale_fill_manual(values = c("Number of patients with at least one index admission during follow-up" = "grey80"), name = NULL) +
+  
+  # Patient counts as text labels
+  geom_text(
+  data = follow_up_patients_uuid,
+  aes(x = age_years,
+      y = n * (1.5/50) + 0.05,   # move text up a bit relative to shorter bars
+      label = paste0("n = ", n)),
+  size = 2.5, vjust = 0
+  )+
+  
+  # Mean readmissions 
+  geom_line(
+    data = readmissions_by_years,
+    aes(x = age_years, y = median_readmissions, group = 1),
+    colour = "black"
+  ) +
+  geom_point(
+    data = readmissions_by_years,
+    aes(x = age_years, y = median_readmissions),
+    colour = "black"
+  ) +
+  
+  scale_y_continuous(
+    name = "Median number of 30-day UHRs per patient",
+    limits = c(0, 3), breaks = seq(0, 3, 1)
+  ) +
+  labs(x = "Patient's age at admission (years)") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 9, face = "bold", angle = 45, hjust = 1),
+    axis.text.y  = element_text(size = 9, face = "bold"),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    plot.title   = element_text(hjust = 0),
+    legend.position = "bottom"
+  )
+
+fig_readmissions_by_years_median
+```
+
+## Distribution of 30-day UHRs events across patient’s age
+
+```{r}
+#| label: fig-30-day-distribution-patient-age-uhrs
+#| fig-cap: "Distribution of 30-day UHRs events across patient’s age (years)^[Follow-up duration is defined by patient's first and last medical records from all available records across all datasets as of the most recent data update. Patients without any hospital admissions or valid index admission during their follow-up period are not included in this plot.]"
+#| echo: false
+#| warning: false
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+#| out-width: 100%
+
+# 1) Prepare UHR events on the AGE scale (years)
+admission_events_age <- hospitalization_main_df_nb %>%
+  # remove invalid index admissions (2 records)
+  filter(!(readmission == "index" & is.na(count_readmissions))) %>%
+  # keep only index and 30-day UHR events
+  filter(grepl("^index$|^30_days_uhr_", readmission)) %>%
+  mutate(
+    # event occurrence age (years) for plotting as points
+    admission_age_years = admission_age_days_firstDate / 365.25,
+    readmission_type = dplyr::case_when(
+      readmission == "index" ~ "Index admission",
+      grepl("^30_days_uhr_", readmission) ~ "30-day UHR"
+    )
+  )
+
+# 2) Patient observation span on AGE scale (+ numeric y for tiny vertical tick)
+patient_followup_age <- hospitalization_main_df_nb %>%
+  filter(readmission == "index" & !is.na(count_readmissions)) %>%
+  distinct(patient_uuid, first_record_age_days, last_record_age_days) %>%
+  mutate(
+    first_record_age_years = first_record_age_days / 365.25,
+    last_record_age_years  = last_record_age_days  / 365.25,
+    followup_duration      = last_record_age_years - first_record_age_years
+  ) %>%
+  arrange(desc(followup_duration)) %>%
+  mutate(
+    patient_label = factor(row_number(), levels = rev(row_number())),
+    patient_y     = as.numeric(patient_label)  # for vertical first record tick
+  )
+
+# 3) Merge events with ranked patients
+admission_plot_data_age <- admission_events_age %>%
+  dplyr::left_join(
+    patient_followup_age %>% dplyr::select(patient_uuid, patient_label),
+    by = "patient_uuid"
+  )
+
+# 4. plot the data
+fig_distribution_uhrs_age <- ggplot() +
+  # Observation span over AGE (dashed)
+  geom_linerange(
+    data = patient_followup_age,
+    aes(
+      y = patient_label,
+      xmin = first_record_age_years,
+      xmax = last_record_age_years
+    ),
+    linetype = "dashed", color = "black", size = 0.4
+  ) +
+  # Tiny vertical tick at FIRST medical record
+  geom_linerange(
+    data = patient_followup_age,
+    aes(
+      x = first_record_age_years,
+      ymin = patient_y - 0.3,
+      ymax = patient_y + 0.3,
+      color = "Start of follow-up"
+    ),
+    linewidth = 0.5
+  ) +
+  # End of observation (diamond at LAST medical record)
+  geom_point(
+    data = patient_followup_age,
+    aes(x = last_record_age_years, y = patient_label, color = "End of follow-up"),
+    shape = 18, size = 1.7
+  ) +
+  # Index admission (orange point)
+  geom_point(
+    data = admission_plot_data_age %>% dplyr::filter(readmission_type == "Index admission"),
+    aes(x = admission_age_years, y = patient_label, color = "Index admission"),
+    size = 1.7
+  ) +
+  # 30-day UHR admissions (blue points)
+  geom_point(
+    data = admission_plot_data_age %>% dplyr::filter(readmission_type == "30-day UHR"),
+    aes(x = admission_age_years, y = patient_label, color = "30-day UHR"),
+    size = 1.7
+  ) +
+  scale_color_manual(
+    name = "Event",
+    values = c(
+      "Index admission"     = "darkorange",
+      "30-day UHR"          = "blue",
+      "Start of follow-up"= "black",
+      "End of follow-up" = "black"
+    ),
+    breaks = c(
+      "Index admission",
+      "30-day UHR",
+      "Start of follow-up",
+      "End of follow-up"
+    ) # <-- sets legend order
+  ) +
+  scale_x_sqrt(breaks = c(0, 0.5, 1, 2, 5, 8, 12, 18, 24), limits = c(0, 24)) +
+  labs(
+    x = "Patient age at admission (years, square-root scale)",
+    y = "Patient"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x   = element_text(size = 9,  face = "bold"),
+    axis.text.y   = element_text(size = 7,  face = "bold", margin = margin(r = -10)),
+    axis.title.x  = element_text(size = 11),
+    axis.title.y  = element_text(size = 11),
+    legend.title  = element_text(size = 11),
+    legend.position = "bottom",
+    legend.text   = element_text(size = 11)
+  )
+
+fig_distribution_uhrs_age
+```
+
+# Main analysis
+
+::: {.content-visible when-format="html"}
+
+```{r}
+#| label: rename-main-df
+#| echo: false
+#| results: 'markup'
+
+#' assign name to the main df for primary analyses and remove variables not
+#'  needed for modelling
+nb_model_main_df <- readmissions_df %>%
+  dplyr::select(-admission_age_days_firstDate, -admission_age_days_lastDate) %>%
+  # to remove unused factor levels such as empty factor for patient uuid
+  droplevels()
+```
+
+```{r}
+#| label: str-df
+#| echo: false
+#| warning: false
+#| results: false
+
+# check outcome and covariates str before modelling
+str(nb_model_main_df)
+```
+
+## Negative Binomial Mixed Effects model
+
+A **negative binomial (NB) mixed-effects** regression model with random intercept and slope was fitted as the main model to assess the effect of covariates on the rate of 30-day UHR per index admission.
+
+Pre-modelling assumptions for negative binomial models are described in [appendix](#appendix). At first instance the random intercept and slope were included to account for individual variability in baseline readmission number and their change over time. In case of convergence issues, it was recommended to first remove the random slope to ensure model convergence and stability.
+
+The analysis began with a minimal model including only the main timescale (`age_index_admission_yr`). This minimal model was used to check model assumptions (see [Appendix](#appendix)), as well as to ensure stable convergence before introducing additional covariates.
+
+### NB minimal — Linear age (RI + RS) and (RI only)
+
+Linear effect of age with patient-level random intercept and random slope for age.
+
+```{r}
+#| label: nb-main-model
+#| echo: false
+#| results: 'markup'
+
+#' Mixed effect Negative Binomial model with offset term 
+#' with random slope and intercept
+#' Note 1: It is fitted a generalized mixed effect model using
+#' the negative binomial distribution with a log link, appropriate for 
+#' overdispersed count data (Morgans et al 2024). nbinom2 has  a variance that
+#'  increases quadratically with the mean (classic NB used in most software)
+#' Note 2: source https://cran.r-project.org/web/packages/glmmTMB/glmmTMB.pdf
+#' Note 3: the offset can be specified in the formula (done below) or 
+#' as using argument offset = log(exptime). The first way was preferred as
+#' simplify posterior analyses with emmeans.
+#' Note 4: linearity of the link function is assumed, meaning that the 
+#' relationship between the predictors and the log of the expected count
+#' is linear.
+
+nb_model_min <- glmmTMB(
+  count_readmissions ~
+    age_index_admission_yr +
+    offset(log(exptime)) + 
+    (1 + age_index_admission_yr | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_main_df
+)
+
+summary(nb_model_min)
+```
+
+Linear effect of age with patient-level random intercept only.
+
+```{r}
+#| label: nb-main-model-ri-only
+#| echo: false
+#| results: 'markup'
+
+nb_model_min_ri_only <- glmmTMB(
+  count_readmissions ~
+    age_index_admission_yr +
+    offset(log(exptime)) + 
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_main_df
+)
+
+summary(nb_model_min_ri_only)
+```
+
+### NB minimal — Non-linear structural form of time (RCS)
+
+After fitting the minimal model with linear assumption of age, a non-linear structural form of time was explored by applying a **restricted cubic spline (RCS)** transformation of the timescale was applied to the minimal model.
+
+For this model, it was first determined the optimal number of knots for the RCS transformation of age by testing models with 3, 4, and 5 knots and comparing their Akaike Information Criterion (AIC) values. The model with the lowest AIC was selected as the optimal model. In case of convergence issues, the number of knots was reduced until convergence was achieved.
+
+```{r}
+#| label: nb-rcs-minimal-test-optimal-knots
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| warning: false
+
+# The function is defined in the functions.R script
+#' Note: it was added to the function the argument "control" to help the model
+#'  to converge with different knots by following:
+#' https://stackoverflow.com/questions/73135114/convergence-criteria-in-glmmtmb-what-are-my-options
+optimal_knots <- suppressMessages(
+  test_knots_ns_glmmTMB(
+    data = nb_model_main_df,
+    predictor = "age_index_admission_yr",
+    response = "count_readmissions",
+    fixed_effects = NULL,
+    random_effect = "1 | patient_uuid",
+    offset_var = "exptime",
+    k_vec = c(3,4,5),
+    family = nbinom2(link = "log")
+  )
+)
+
+optimal_knots
+```
+
+The model with 4 knots had the lowest AIC, indicating the best fit among the tested models. Results were consistent when including all covariates (see [appendix](#appendix)). A k = 4 offers an adequate fit of the model and is a good compromise between flexibility and loss of precision caused by overfitting a small sample [@harrellRegressionModelingStrategies2015].
+
+```{r}
+#| label: number-knots
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| warning: false
+
+#' Defining knots for the RCS transformation of age
+#' Position of knots are based on default quantiles:
+#' position at default quantiles with 4 knots:
+#' .05 .35 .65 .95 (rcspline.eval vignettes and Harrel 2015) 
+knots_rcs <- attributes(rms::rcs(nb_model_main_df$age_index_admission_yr, 4))$parms
+
+# display knots location for age at index admission
+paste0("Knots for age at index admission (years): ",
+       paste(round(knots_rcs, 2), collapse = ", "))
+```
+
+```{r}
+#| label: nb-rcs-minimal
+#| echo: false
+#| results: 'markup'
+
+# Several tutorials for implementing the rcs in glmTMB package were consulted:
+#' https://backend.orbit.dtu.dk/ws/portalfiles/portal/154739064/Publishers_version.pdf
+#' https://bora.uib.no/bora-xmlui/bitstream/handle/11250/3145134/51107913.pdf 
+#' Note 1: the random slope for time is removed here to ensure model convergence,
+#' as the model became too complex: 
+#' https://stat.ethz.ch/pipermail/r-sig-mixed-models/2018q2/026829.html
+#' Note 2: rms::rcs(age_index_admission_yr, parms = knots_rcs) function gives
+#'  the same results  when ns() explicity mention the location of the internal
+#'   and boundaries knots. 
+#' Note 3: Due to the ns() has more examples in the glmmTMB package, it was 
+#' preferred to use. Moreover, the ns() has shown less convergence issues when 
+#' testing models below.
+
+# Fit the model with RCS transformation of age
+nb_model_rcs_min <- glmmTMB(
+  count_readmissions ~
+    ns(age_index_admission_yr,
+       knots = knots_rcs[2:3], # internal knots
+       Boundary.knots = c(knots_rcs[1], knots_rcs[4])) + # boundary knots
+    offset(log(exptime)) +
+    (1 | patient_uuid),
+  data = nb_model_main_df,
+  family = nbinom2(link = "log")
+  )
+
+# Model summary
+summary(nb_model_rcs_min)
+```
+
+### Comparing performance of minimal models
+
+```{r}
+#| label: tbl-nb-performance-comparison-minimal
+#| tbl-cap: "Comparing performance of minimal models based on different performance indices"
+#| echo: false
+#| results: 'markup'
+
+compare_performance(nb_model_min, # mixed effect NB minimal model
+                    nb_model_min_ri_only, # with random intercept only
+                    nb_model_rcs_min) # with restricted cubic splines
+```
+
+The negative binomial mixed-effects model with RCS transformation of age provided a better fit between proposed minimal models (@tbl-nb-performance-comparison-minimal) and it has also satisfied the assumptions of the model (see [appendix](#appendix)).Therefore, this model was used as the basis for further analyses.
+
+### Covariate selection
+
+Given the small sample size, starting with the full model risked overfitting, inflated standard errors, and instability in the selection process. Therefore, to ensure a statistically and computationally stable model, covariate selection was performed using the Buildmer package, which is suited for models fitted with the glmmTMB framework as first identifies the **maximal feasible model** and then applies a **stepwise backward elimination** procedure based on the Akaike Information Criterion (AIC) [@voetenBuildmerStepwiseElimination2025].
+
+Specifically, the process begins with the forced terms (non-linear age at index admission, patient sex, and random effects) and sequentially adds other covariates according to their contribution to model fit, as measured by the AIC. Once the maximal feasible model is reached, Buildmer automatically applies backward elimination to remove covariates that do not improve model fit, yielding the final optimal model.
+
+Additionally, to assess the robustness of the covariates retained through these selection procedures, a model averaging approach was applied (see [appendix](#appendix)):
+
+a.  All possible combinations of covariates were evaluated from the maximal/full model with the dredge function from MuMIn package. The model with the lowest AIC was identified, and all models with ΔAIC \< 2 were extracted for the next step.
+
+b.  The sum of Akaike weights for each covariate was calculated, highlighting those that consistently contributed to model fit across competing model specifications [@maesUsingMultimodelInference2021; @fletcherWhyModelAveraging2018].
+
+*Note: the stepwise selection was also manually tested, yielding the same results to the automatic procedure (results not shown)*
+
+##### Automatic backward stepwise feature selection
+
+```{r}
+#| label: nb-main-model-stepwise-automatic
+#| echo: false
+#| eval: false
+#| warning: false
+#| message: false
+
+# Note: Tutorials were consulted for the automatic stepwise selection:
+#' https://cran.r-project.org/web/packages/buildmer/buildmer.pdf
+#' https://stats.stackexchange.com/questions/664985/retaining-fixed-effects-during-buildglmmtmb
+
+#' formula: all covariates without forced, random effects and offset as are 
+#' specified in the buildmerControl include argument
+f <- count_readmissions ~ neonatal_onset + other_epilepsy_mutations +
+  recurrent_variant + seizure_related_index_admission +
+  length_of_index_stay_days_cat + respiratory_support_index_admission +
+  tech_assistance_ever + vns_insertion_ever + n_distinct_asm_index_admission +
+  adverse_effect_index_admission +
+  ketogenic_diet_admission + quinidine_admission
+
+stepwise_backward_test <- buildmer::buildglmmTMB(
+  #' keep the same full list stated when maximal feasible model was built as 
+  #' the order step will be applied again
+  f, 
+  data = nb_model_main_df,
+  family = nbinom2(link = "log"),
+  buildmerControl = buildmerControl(
+    #' force terms (sex, age, random effects and offset) not subject 
+    #' to testing for elimination. 
+    include = ~ ns(age_index_admission_yr,
+       knots = knots_rcs[2:3],
+       Boundary.knots = c(knots_rcs[1], knots_rcs[4])) +
+      sex + offset(log(exptime)) + (1 | patient_uuid),
+    #' 1. The order step is useful if the maximal model includes random effects: 
+    #' buildmer will start out with an empty model and keeps adding terms to
+    #'  this model until convergence can no longer be achieved.
+    #' 2.  ordered backward elimination means that first reach the maximal 
+    #' feasible model and then eliminate terms one by one.
+    direction = c('order', 'backward'), 
+    #' Criterion used to test terms for their contribution to the model fit
+    crit = 'AIC',
+    #' Criterion used to test terms for elimination in the elimination step
+    elim = 'AIC'
+    )
+  )
+```
+
+```{r}
+#| label: nb-main-model-stepwise-automatic-output-formula
+#| echo: false
+#| warning: false
+#| results: 'markup'
+#| message: false
+
+# note: the output was saved in r rds file as takes few minutes to run.
+# dir.create("~/RWE-rare_disease/Hospitalizations/output/rds_data")
+# saveRDS(stepwise_backward_test, "rds_data/automatic_stepwise_backward_test.rds")
+
+# Load the saved stepwise backward file
+stepwise_backward_test_file <- readRDS("rds_data/automatic_stepwise_backward_test.rds")
+
+# assign the formula from the stepwise backward
+automatic_backward_stepwise <- formula(stepwise_backward_test_file@model)
+
+# print the formula
+automatic_backward_stepwise
+```
+
+The automatic backward stepwise selection procedure removed four covariates from the maximal feasible model: `vns_insertion_ever`, `tech_assistance_ever`, `neonatal_onset`, `respiratory_support_index_admission`.
+
+```{r}
+#| label: nb-rcs-stepwise-automatic-selection
+#| echo: false
+#| results: 'markup'
+
+# Fit the automatic stepwise model for further comparisons
+nb_model_rcs_stepwise <- glmmTMB(
+  # formula from the automatic stepwise selection
+  formula = automatic_backward_stepwise,
+  data = nb_model_main_df,
+  family = nbinom2(link = "log")
+)
+
+summary(nb_model_rcs_stepwise)
+```
+
+The robustness of the stepwise selection results was further evaluated through model averaging across all possible covariate combinations (see [appendix](#appendix)).This assessment confirmed the stepwise model (`nb_model_rcs_stepwise`) as the an appropriate **main effects model** for subsequent analyses.
+
+The final reteained covariates were: `sex`, `age_index_admission_yr`, `other_epilepsy_mutations`, `recurrent_variant`. `adverse_effect_index_admission`, `length_of_index_stay_days_cat`, `quinidine_admission`, `ketogenic_diet_admission`, `seizure_related_index_admission` and `n_distinct_asm_index_admission`.
+
+### Testing inteaction terms
+
+An interaction between two variables implies that the effect of each variable is not constant over levels of the other variable [@harrellRegressionModelingStrategies2013]. In the present analysis, interactions were considered not only because of their potential clinical relevance in identifying subgroups with different risk profiles, but also to improve model fit by allowing the additional flexibility provided by interaction terms [@vanderweeleTutorialInteraction2014].
+
+Given the limited prior evidence on potential interactions between covariates for rare_disease, it was focused on testing interactions of retained covariates with age at admission. Interaction terms were added one by one to the main effects model obtained in the previous step, and the goodness of fit was assessed using AIC and the Likelihood Ratio Test (LRT) to compare the model without interaction terms [@harrellRegressionModelingStrategies2013].
+
+Interaction term which significantly improved the model fit were retained in the final model after checking comparison graphs and clinical plausibility.
+
+#### Age at index admission with sex
+
+```{r}
+#| label: interaction-terms-age-sex
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+# interaction sex*age
+nb_model_rcs_int_sex_age <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) +
+    ns(age_index_admission_yr, 
+    knots = knots_rcs[2:3], Boundary.knots = c(knots_rcs[1], 
+        knots_rcs[4]))*sex + 
+    length_of_index_stay_days_cat +
+    adverse_effect_index_admission + 
+    recurrent_variant + 
+    other_epilepsy_mutations + 
+    quinidine_admission + 
+    ketogenic_diet_admission + 
+    seizure_related_index_admission +
+    n_distinct_asm_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_main_df
+)
+
+# the interaction does not significantly improves the goodness of fit of the model.
+anova(nb_model_rcs_stepwise, nb_model_rcs_int_sex_age)
+```
+
+#### Age at index admission with length of index stay
+
+```{r}
+#| label: interaction-terms-age-lohs
+#| echo: false
+#| results: 'markup'
+
+# interaction age*length_of_index_stay_days_cat
+nb_model_rcs_int_age_lohs <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) +
+    ns(age_index_admission_yr, 
+    knots = knots_rcs[2:3], Boundary.knots = c(knots_rcs[1], 
+        knots_rcs[4]))*length_of_index_stay_days_cat*
+    sex + 
+    adverse_effect_index_admission +
+    recurrent_variant + 
+    other_epilepsy_mutations + 
+    quinidine_admission + 
+    ketogenic_diet_admission + 
+    seizure_related_index_admission +
+    n_distinct_asm_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_main_df
+)
+
+# the interaction does not significantly improves the goodness of fit of the model.
+anova(nb_model_rcs_stepwise, nb_model_rcs_int_age_lohs)
+```
+
+#### Age at index admission with quinidine
+
+```{r}
+#| label: interaction-terms-age-quinidine 
+#| echo: false
+#| results: 'markup'
+
+# interaction age*quinidine_admission
+nb_model_rcs_int_age_quinid <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) +
+    ns(age_index_admission_yr, 
+    knots = knots_rcs[2:3], Boundary.knots = c(knots_rcs[1], 
+        knots_rcs[4]))*quinidine_admission +
+    sex + 
+    length_of_index_stay_days_cat +
+    adverse_effect_index_admission +
+    recurrent_variant +
+    other_epilepsy_mutations + 
+    ketogenic_diet_admission + 
+    seizure_related_index_admission +
+    n_distinct_asm_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_main_df,
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS")
+    ))
+
+# the interaction does not converge
+anova(nb_model_rcs_stepwise, nb_model_rcs_int_age_quinid) 
+```
+
+#### Age at index admission with ketogenic diet
+
+```{r}
+#| label: interaction-terms-age-keto
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+# interaction age*ketogenic_diet_admission
+nb_model_rcs_int_age_keto <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) +
+    ns(age_index_admission_yr, 
+    knots = knots_rcs[2:3], Boundary.knots = c(knots_rcs[1], 
+        knots_rcs[4]))*ketogenic_diet_admission +
+    sex + 
+    length_of_index_stay_days_cat +
+    adverse_effect_index_admission +
+    recurrent_variant +
+    other_epilepsy_mutations + 
+    quinidine_admission + 
+    seizure_related_index_admission +
+    n_distinct_asm_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_main_df,
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS")
+  ))
+
+# the interaction does not significantly improves the goodness of fit of the model.
+anova(nb_model_rcs_stepwise, nb_model_rcs_int_age_keto)
+```
+
+#### Age at index admission with seizure-related index admission
+
+```{r}
+#| label: interaction-terms-age-sr
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+# interaction age*seizure_related_index_admission
+nb_model_rcs_int_age_sr <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) +
+    ns(age_index_admission_yr, 
+    knots = knots_rcs[2:3], Boundary.knots = c(knots_rcs[1], 
+        knots_rcs[4]))*seizure_related_index_admission +
+    sex + 
+    length_of_index_stay_days_cat +
+    adverse_effect_index_admission +
+    recurrent_variant +
+    other_epilepsy_mutations + 
+    quinidine_admission +
+    ketogenic_diet_admission +
+    n_distinct_asm_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_main_df,
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS")
+    ))
+
+# the interaction significantly improves the goodness of fit of the model (p= 0.009492 **)
+anova(nb_model_rcs_stepwise, nb_model_rcs_int_age_sr)
+```
+
+#### Age at index admission with number of ASMs at index admission
+
+```{r}
+#| label: interaction-terms-age-asm
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+# interaction age*seizure_related_index_admission
+nb_model_rcs_int_age_asm <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) +
+    ns(age_index_admission_yr, 
+    knots = knots_rcs[2:3], Boundary.knots = c(knots_rcs[1], 
+        knots_rcs[4]))*n_distinct_asm_index_admission +
+    sex + 
+    length_of_index_stay_days_cat +
+    adverse_effect_index_admission +
+    recurrent_variant +
+    other_epilepsy_mutations + 
+    quinidine_admission +
+    ketogenic_diet_admission +
+    seizure_related_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_main_df,
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS")
+    ))
+
+# the interaction significantly improves the goodness of fit of the model (p = 0.01788*)
+anova(nb_model_rcs_stepwise, nb_model_rcs_int_age_asm)
+```
+
+A total of two interactions were found to significantly improve the model fit when added one by one to the main effects model, as assessed by LRT (p \< 0.05). These were:
+
+-   `age × seizure-related index admission`
+
+-   `age × number of ASMs at index admission`
+
+Considering clinical relevance and model parsimony, the interaction `age × seizure-related index admission` was selected to be included in the final model. Seizure-related hospitalizations are more common in younger patients with epilepsy, and the risk of readmission may vary with age in this group.
+
+Although the `age_admission_yr` x `number of ASMs at index admission` was statistically significant by LRT, the observed differences occurred mainly at older ages where very few patients were available for comparison. This resulted in unstable estimates with wide confidence intervals, limiting the reliability of the effect.
+
+For this reason, that interaction was finally not included in the **preliminary final model**:
+
+```{r}
+#| label: nb-model-stepwise-interactions
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+nb_model_rcs_stepwise_interactions <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) + 
+    ns(age_index_admission_yr, 
+       knots = knots_rcs[2:3], 
+       Boundary.knots = c(knots_rcs[1],
+                          knots_rcs[4]))*seizure_related_index_admission +
+    sex +
+    adverse_effect_index_admission +
+    length_of_index_stay_days_cat +
+    recurrent_variant +
+    other_epilepsy_mutations +
+    quinidine_admission +
+    ketogenic_diet_admission +
+    n_distinct_asm_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_main_df,
+  # add control options to help the model converge
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS")
+  )
+)
+
+summary(nb_model_rcs_stepwise_interactions)
+```
+
+##### Comparing performance
+
+```{r}
+#| label: tbl-nb-performance-stepwise-interaction
+#| tbl-cap: "Comparing performance between main effects model and model with interaction terms"
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| warning: false
+
+compare_performance(        
+  nb_model_rcs_stepwise, # stepwise manual and automatic
+  nb_model_rcs_stepwise_interactions # model with interactions
+  )
+```
+
+The model with the interaction terms `age × seizure-related index admission` had a better fit for the AIC than the main effects model (@tbl-nb-performance-stepwise-interaction).
+
+The `nb_model_rcs_stepwise_interactions` was defined as the **final model** for conducting the next steps of statistical outputs for main analyses.
+
+The final model has converged properly and satisfied the model assumptions (see [appendix](#appendix)).
+
+:::
+
+## Statistical outputs
+
+### Overall effects of covariates on the rate of 30-day UHR per index admission
+
+```{r}
+#| label: tbl-regression-final
+#| tbl-cap: "Adjusted incidence rate ratios (IRRs) for 30-day UHRs for final multivariable model (fixed effects)."
+#| echo: false
+#| results: 'markup'
+
+table_regression_nb <- tbl_regression(
+  nb_model_rcs_stepwise_interactions,
+  exponentiate = TRUE,
+  conf.level = 0.95,
+  label = list(
+    sex = "Sex",
+    other_epilepsy_mutations = "Other epilepsy mutations",
+    recurrent_variant = "Highly recurrent variant",
+    length_of_index_stay_days_cat = "Length of index hospital stay",
+    adverse_effect_index_admission = "Adverse effect during index admission",
+    ketogenic_diet_admission = "Ketogenic dietary intervention during index admission",
+    quinidine_admission = "Quinidine treatment during index admission",
+    n_distinct_asm_index_admission = "Number of ASMs at index admission"
+  ),
+  # remove issue with group(cond) column
+  tidy_fun = function(x, ...) {
+    broom.mixed::tidy(x, component = "cond", ...) %>%
+      dplyr::select(-component)   
+  }) %>%
+  modify_header(estimate = "**IRR**") %>%
+  modify_table_body(~ dplyr::select(., -p.value)) %>%
+  bold_labels() %>%
+  italicize_levels()
+
+
+# Rename levels for binary variables
+table_regression_nb$table_body <- table_regression_nb$table_body %>%
+  mutate(label = case_when(
+    label == "0" ~ "No",
+    label == "1" ~ "Yes",
+    label == "male" ~ "Male",
+    label == "female" ~ "Female",
+    TRUE ~ label
+  ))
+
+# Remove the spline rows explicitly and the interaction term row
+table_regression_nb$table_body <- table_regression_nb$table_body %>%
+  filter(!str_detect(variable, "^ns\\(age_index_admission_yr")) %>%
+  filter(!str_detect(variable, "^seizure_related_index_admission")) %>%
+  filter(!str_detect(variable, "patient_uuid"))
+
+# print the table with kableExtra
+tbl_regression_nb <- table_regression_nb %>%
+  modify_footnote(
+    estimate ~ paste(
+      "IRR = Incidence Rate Ratio. IRR > 1 indicates a higher rate of 30-day UHRs; IRR < 1 indicates a lower rate.",
+      "For categorical predictors, IRRs compare each level with the reference category.",
+      "For continuous predictors, IRRs correspond to the rate change per 1-unit increase in the predictor.",
+      "Estimates are adjusted for all variables in the model. Nonlinear spline terms and random-effect estimates are not reported.",
+      sep = " "
+    )
+  ) %>%
+  as_flex_table() %>%
+  flextable::font(fontname = "Century Gothic", part = "all") %>%
+  flextable::fontsize(size = 11, part = "all") %>%
+  flextable::fontsize(part = "footer", size = 9) %>%  
+  flextable::autofit()
+
+tbl_regression_nb
+```
+
+### Marginal means estimations
+
+For clarity, we present two separate EMM summaries from the same fitted model: (1) overall age effects obtained by averaging over covariates and retained interaction terms; and (2) stratified age effects estimated conditional on seizure-related status to illustrate the interaction. The second set was not computed from the first and both come directly from the final fitted model (`nb_model_rcs_stepwise_interactions`).
+
+#### Main effect of age at index admission
+
+##### Table: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: tbl-emmeans-table
+#| tbl-cap: "Overall estimated marginal means of 30-day UHR number per 100 index admissions."
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+# Estimate marginal means (with 95% CI) of readmission rates by age at admission
+# - adjusted to mean observed exposure time (29.888 days)
+# - averaging over all other covariates (nuisance factors) with equal weights
+# - results reported on natural scale (rate or count) at specified ages (0–20 years)
+#' https://cran.r-project.org/web/packages/emmeans/vignettes/messy-data.html#nuisance
+#' https://rvlenth.github.io/emmeans/articles/sophisticated.html?q=offset#offsets
+#' https://rvlenth.github.io/emmeans/articles/xplanations.html#offsets
+#' https://m-clark.github.io/posts/2020-06-15-predict-with-offset/
+
+# Define the sequence of ages (in years) at which to estimate marginal means
+# From 0 to 5 by 0.5
+age_first_seq <- seq(0, 5, by = 0.5)
+
+# From 6 to 18 by 1
+age_second_seq <- seq(6, 18, by = 1)
+
+# Combine the two sequences
+age_seq <- c(age_first_seq, age_second_seq)
+
+# Build the reference grid explicitly
+#' non.nuisance = "age_index_admission_yr" ensures age is not averaged 
+#' (we want to see estimates for specific time points)
+#' all other predictors (nuisance factors) are averaged over equally
+grid_emmeans_full <- ref_grid(
+  nb_model_rcs_stepwise_interactions, # final model with interactions
+  at = list(age_index_admission_yr = age_seq),
+  non.nuisance = "age_index_admission_yr", # do not average
+  params = "knots_rcs",  # state knot values for the splines model,
+  weights = "equal" # average others with equal weights
+)
+
+# https://stats.stackexchange.com/questions/499089/emmeans-output-interpretation-of-a-glmer-fit-with-nesting
+# https://stackoverflow.com/questions/79489617/how-to-extract-std-dev-from-varcorr-glmmtmb
+#' Define total standard deviation for bias adjustment (only random is given
+#'  in glmmtmb models)
+cor_random_mod <- lme4::VarCorr(nb_model_rcs_stepwise_interactions)
+total_sd <- sapply(cor_random_mod$cond, function(x) attr(x, "stddev"))
+
+#' Model with offset, weights assumed equal
+readmissions_by_age <- emmeans(
+  grid_emmeans_full, ~ age_index_admission_yr,
+  type = "response", # results back-transformed to the natural scale 
+  #' use of offset in emmeans to get the rate per adjusted index 
+  offset = mean(log(nb_model_main_df$exptime)), # same as default and ≈ log(30)
+  # Note: Note that the random effects variance is close to zero, so bias 
+  # adjustment has literally no effect here.
+  bias.adj = TRUE, # bias adjustment for back-transforming from log scale
+  sigma = total_sd # include the standard deviation of the random effect
+  )
+
+# Convert the emmeans object to a regular dataframe
+readmissions_by_age_df <- as.data.frame(readmissions_by_age)
+
+# View results
+# Scaling up the number per 100 index with respective IC95% for interpretation
+#'https://hcup-us.ahrq.gov/reports/statbriefs/sb304-readmissions-2016-2020.jsp 
+#' https://www.bmj.com/content/366/bmj.l4563.abstract
+
+#' Note: emmeans on glmmTMB models uses asymptotic Wald (z) inference, so
+#' degrees of freedom are treated as Inf and CIs appear as asymp.LCL/UCL.
+tbl_readmissions_by_age_df <- readmissions_by_age_df %>%
+  mutate(
+    combined = sprintf(
+      "%.1f (%.1f; %.1f)",
+      response * 100, asymp.LCL * 100, asymp.UCL * 100
+    )
+  ) %>%
+  dplyr::select(age_index_admission_yr, combined) %>%
+  rename(
+    "Age at index admission (years)" = age_index_admission_yr,
+    "Number of 30-day UHRs per 100 index admissions (95% CI)" = combined
+  ) %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(values = c(
+    "Note 1: the endpoint was scaled to 100 index admissions as standard practice to facilitate interpretation.",
+    "Note 2: results indicate, at each age, how many 30-day unplanned readmissions would be expected for every 100 index admissions (or 100 discharges)."
+  )) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) %>%
+  flextable::align(j = 1, part = "all", align = "left") %>%
+  flextable::align(j = 2, part = "all", align = "center")
+
+tbl_readmissions_by_age_df
+```
+
+##### Graph: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: fig-emmeans-plot-years-plot
+#| fig-cap: "Fitted 30-day UHR number per 100 index admissions (black line) with 95% confidence intervals (grey shaded area), by patient age at index admission. Red dots indicate time points (6th, 12th , 18th and 28th months) at which the contrast pairwise analysis were conducted."
+#| echo: false
+#| results: 'asis'
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+#| out-width: 100%
+
+# plot the estimated rate across age at index admission by years
+#' Because 30-day readmissions are measured within a fixed time window for all 
+#' patients, results are reported as the number of 30-day UHRs per 100 index
+#'  admissions rather than as rates, to avoid confusion with time-based
+#'   incidence rates. Similar approach can be consulted here:
+#'    https://www.bmj.com/content/366/bmj.l4563.abstract
+#'    https://rdrr.io/cran/emmeans/man/ref_grid.html
+
+fig_emmeans_main <- ggplot(readmissions_by_age_df, aes(x = age_index_admission_yr, 
+                                   y = response * 100)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = asymp.LCL * 100, ymax = asymp.UCL * 100), alpha = 0.2) +
+  geom_point(data = subset(readmissions_by_age_df, age_index_admission_yr %in%
+                             c(0.5, 1, 1.5, 2)), 
+             aes(x = age_index_admission_yr, y = response * 100),
+             color = "red", size = 1.5) +
+  labs(
+    x = "Patient age (years)",
+    y = "Number of 30-day UHRs per 100 index admissions"
+  ) +
+  scale_x_continuous(breaks = seq(0, 18, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 200, by = 25)) +
+  coord_cartesian(ylim = c(0, max(readmissions_by_age_df$asymp.UCL*100, na.rm = TRUE))) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 9, face = "bold"),
+    axis.text.y = element_text(size = 9, face = "bold", margin = margin(r = -10)),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    legend.title = element_text(size = 11),
+    legend.position = "bottom",
+    legend.text = element_text(size = 11)
+  )
+
+fig_emmeans_main
+```
+
+##### Contrast between time points of interest
+
+```{r}
+#| label: tbl-contrast-time-points-model-nb
+#| tbl-cap: "Pairwise contrast for time-points of interest (6, 12, 18, and 24 months)"
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+# obtain time point of interest to compare from the total emmeans grid
+# Pairwise comparisons at 6, 12, 18, and 24 months of life using t-tests and 
+# the Kenward-Roger's approximation of the degrees of freedom.
+emm_subset_nb_main <- subset(readmissions_by_age, 
+                             age_index_admission_yr %in% c(0.5, 1, 1.5, 2))
+ 
+# time point comparison
+# Using wald tests based on the asymptotic distribution of the estimates
+contrast_nb_main <- emmeans::contrast(emm_subset_nb_main,
+                                      method = "pairwise", # all pairwise comparisons
+                                      ref = 1, # reference is 0.5 years
+                                      adjust = "tukey"
+                                      )
+
+tbl_contrast_nb_main <- contrast_nb_main %>%
+  as.data.frame() %>%
+  dplyr::select(-c("df", "null", "z.ratio")) %>%
+  transmute(
+    `Contrasted time-points (years)` =
+      str_squish(str_replace_all(contrast, c("age_index_admission_yr" = "", "/" = " vs "))),
+    Ratio = ratio,
+    SE = SE,
+    `P value` = case_when(
+      p.value < 1e-4 ~ "< 0.0001",
+      p.value < 0.05 ~ "< 0.05",
+      TRUE ~ sprintf("%.3f", p.value)
+    )
+  ) %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::colformat_double(j = c("Ratio", "SE"), digits = 2) %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(
+    values = c(
+      "Note 1: Tukey-adjusted wald tests performed on the log scale, based on the asymptotic distribution of the estimates.",
+      "Note 2: P-values < 0.05 indicate that the predicted number of 30-day UHRs at the contrasted time points were significantly different."
+    )
+  ) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) 
+
+tbl_contrast_nb_main
+```
+
+#### Interaction effect of age at index admission and seizure-related index admission
+
+##### Table: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: tbl-emmeans-table-interactions
+#| tbl-cap: "Estimated marginal means of the number of 30-day UHR per 100 index admissions by selected time points for seizure-related and non-seizure related index admissions."
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+grid_by_seizure <- ref_grid(
+  nb_model_rcs_stepwise_interactions,
+  at = list(age_index_admission_yr = age_seq),
+  # do not average the interaction terms to get the values per time point
+  non.nuisance = c("age_index_admission_yr", "seizure_related_index_admission"), 
+  params = "knots_rcs",
+  weights = "equal" # average others with equal weights
+)
+
+readmissions_by_age_int <- emmeans(
+  # add the interaction term to the grid
+  grid_by_seizure, ~ age_index_admission_yr | seizure_related_index_admission,
+  type = "response", 
+  offset = mean(log(nb_model_main_df$exptime)),
+  bias.adj = TRUE, # bias adjustment for log link back-transformation
+  sigma = total_sd # include the standard deviation of the random effect
+  )
+
+# Convert the emmeans object to a regular dataframe
+readmissions_by_age_int_df <- as.data.frame(readmissions_by_age_int)
+
+# # View the updated dataframe
+readmissions_by_age_int_df %>%
+  mutate(
+    grp = ifelse(seizure_related_index_admission == 1, "SR", "NSR"),
+    num = round(response * 100, 1),
+    CI  = sprintf("(%.1f; %.1f)", asymp.LCL * 100, asymp.UCL * 100)
+  ) %>%
+  mutate(val = paste0(num, " ", CI)) %>%
+  dplyr::select(age = age_index_admission_yr, grp, val) %>%
+  tidyr::pivot_wider(names_from = grp, values_from = val) %>%
+  dplyr::rename(
+    `Age at index admission (years)` = age,
+    `Seizure-related` = SR,
+    `Non-seizure-related` = NSR
+  ) %>%
+  # ensure column order: Age | Seizure-related | Non-seizure-related
+  dplyr::select(`Age at index admission (years)`,
+                `Seizure-related`,
+                `Non-seizure-related`) %>%
+  flextable::flextable() %>%
+  # second header row (default) labels
+  flextable::set_header_labels(
+    `Age at index admission (years)` = "Age at index admission (years)",
+    `Seizure-related` = "Seizure-related",
+    `Non-seizure-related` = "Non-seizure-related"
+  ) %>%
+  # add top header row: first cell blank over Age, second cell spans the two strata
+  flextable::add_header_row(
+    values = c("", "Number of 30-day UHR per 100 index admissions (95% CI)"),
+    colwidths = c(1, 2)
+  ) %>%
+  # styling
+  flextable::align(part = "header", align = "center") %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(
+  values = c(
+    "Note 1: the endpoint was scaled to 100 index admissions as standard practice to facilitate interpretation.",
+    "Note 2: results indicate, at each age, the expected number of 30-day unplanned readmissions per 100 index admissions (or 100 discharges), shown separately for seizure-related and non–seizure-related index admissions."
+  )) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) %>%
+  flextable::align(j = 1, part = "all", align = "left") %>%
+  flextable::align(j = 2:3, part = "body", align = "center")
+```
+
+##### Graph: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: fig-emmeans-plot-years-plot-interaction
+#| fig-cap: "Fitted of number 30-day UHR per 100 index admissions (discharges) for seizure related and non-seizure related admissions (solid line) with 95% confidence intervals (shaded area), by patient age at index admission in years. Red dots indicate time points (6th, 12th , 18th and 28th months) at which the contrast pairwise analysis were conducted."
+#| echo: false
+#| results: 'asis'
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+#| out-width: 100%
+
+readmissions_by_age_int_df_plot <- readmissions_by_age_int_df %>%
+  mutate(
+    seizure_related_index_admission =
+      factor(seizure_related_index_admission, 
+             labels = c("Non-seizure-related", "Seizure-related")))
+
+# plot the estimated rate across age at index admission by years
+fig_emmeans_main_int_sr <- ggplot(readmissions_by_age_int_df_plot, aes(
+  x = age_index_admission_yr,
+  y = response * 100,
+  colour = seizure_related_index_admission,
+  fill   = seizure_related_index_admission
+  )) +
+  geom_ribbon(aes(ymin = asymp.LCL * 100, ymax = asymp.UCL * 100), alpha = 0.18, colour = NA) +
+  geom_line(size = 1.1) +
+  geom_point(
+    data = subset(readmissions_by_age_int_df_plot,
+                  age_index_admission_yr %in% c(0.5, 1, 1.5, 2)), 
+    aes(x = age_index_admission_yr, y = response * 100),
+    color = "red", size = 1.5,
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  labs(
+    x = "Patient age (years)",
+    y = "Number of 30-day UHRs per 100 index admissions",
+    colour = "Type of admission diagnosis", 
+    fill   = "Type of admission diagnosis"
+  ) +
+  scale_x_continuous(breaks = seq(0, 18, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 200, by = 25)) +
+  coord_cartesian(ylim = c(0, max(readmissions_by_age_int_df_plot$asymp.UCL * 100, na.rm = TRUE))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(size = 9, face = "bold"),
+    axis.text.y = element_text(size = 9, face = "bold", margin = margin(r = -10)),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    legend.title = element_text(size = 11),
+    legend.position = "bottom",
+    legend.text = element_text(size = 11)
+  )
+
+fig_emmeans_main_int_sr
+```
+
+##### Contrast between time points of interest
+
+```{r}
+#| label: tbl-contrast-time-points-model-nb-int
+#| tbl-cap: "Contrast for time-points of interest (6, 12, 18, and 24 months) with interaction term"
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+# obtain time point of interest to compare from the total emmeans grid
+# Pairwise comparisons at 6, 12, 18, and 24 months of life using t-tests and 
+# the Kenward-Roger's approximation of the degrees of freedom.
+emm_subset_nb_main_int <- subset(
+  readmissions_by_age_int, 
+  age_index_admission_yr %in% c(0.5, 1, 1.5, 2))
+
+# time point comparison
+contrast_nb_main_int <- emmeans::contrast(emm_subset_nb_main_int,
+                                            method = "pairwise", # all pairwise comparisons
+                                            ref = 1, # reference is 0.5 years
+                                            by = "seizure_related_index_admission", # keeps comparisons within each level
+                                            adjust = "tukey" # no p-value adjustment for multiple comparisons
+                                            ) 
+
+
+tbl_contrast_nb_main_int <- contrast_nb_main_int %>%
+  as.data.frame() %>%
+  transmute(
+    # Clean the contrast labels from the age term and make it "a vs b"
+    `Contrasted time-points (years)` =
+      str_squish(str_replace_all(contrast, c("age_index_admission_yr" = "", "/" = " vs "))),
+    `Type of admission diagnosis` = factor(
+      seizure_related_index_admission,
+      levels = c(0, 1),
+      labels = c("Non-seizure-related", "Seizure-related")),
+    Ratio = ratio,
+    SE = SE,
+    `P value` = case_when(
+      p.value < 1e-4 ~ "< 0.0001",
+      p.value < 0.05 ~ "< 0.05",
+      TRUE ~ sprintf("%.3f", p.value)
+    )
+  ) %>%
+  flextable::regulartable() %>%
+  flextable::colformat_double(j = c("Ratio", "SE") , digits = 2) %>%
+  flextable::autofit() %>%
+  flextable::add_footer_lines(
+    values = c(
+      "Note 1: Tukey-adjusted wald tests performed on the log scale, based on the asymptotic distribution of the estimates.",
+      "Note 2: P-values < 0.05 indicate that the predicted number of 30-day UHRs at the contrasted time points were significantly different."
+    )
+  ) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) %>%
+  flextable::bold(part = "header", bold = TRUE)
+
+tbl_contrast_nb_main_int
+```
+
+# Sensitivity analysis
+
+Merging admission records into continuous hospitalization episode may help mitigate the overestimation of hospital admission events due to potential transfers to a different hospital or within the same hospital in RWD’s patients.
+
+To assess this, the main analysis was repeated under two different scenarios in which raw hospital admissions records occurring on the same day or the day after last discharge will be merged into a single hospitalization episode. For each scenario, the merged hospital admission:
+
+-   Used the earliest admission date as the start date,
+
+-   Used the latest discharge date as the end date and,
+
+-   Was performed only when the admissions had the same type of diagnosis (i.e., both admissions with a seizure-related type or both admissions with a non-seizure-related type). If types differed between admission, the records remained separated.
+
+The main analysis was repeated for each scenario.
+
+::: {.content-visible when-format="html"}
+
+## Sensitivity analysis (I): Merging hospital admission records occurring on the same day after last discharge
+
+```{r}
+#| label: sensitivity-analyses-merging-admissions-same-day-rename
+#| echo: false
+#| warning: false
+
+# Select, order and rename variables for readmission df
+#' Note1: readmission variable used to filter the desired subset of data
+#' was derived in the data management file, in the sensitivity analysis section
+#' Note2: Index derived in the data management file already excludes planned, birth
+# and outpatient admissions
+readmissions_merged_same_day_df <- hospitalizations_merged_same_day_df %>%
+  #' keep index with valid exptime and remove those with invalid index 
+  #' admission which doens't allow to count readmissions (i.e. exptime == 0)
+  filter(readmission == "index" & !is.na(count_readmissions)) %>%
+  # order, rename and select variables of interest
+  dplyr::select(
+    # patient identifier
+    patient_uuid,
+    # admissions related features
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    # demographics
+    sex,
+    age_index_admission_yr = age_admission_yr,
+    # genetic mutations
+    other_epilepsy_mutations,
+    recurrent_variant,
+    neonatal_onset,
+    # clinical history
+    seizure_related_index_admission = seizure_related_admission,
+    length_of_index_stay_days_cat = length_of_stay_days_cat,
+    respiratory_support_index_admission = respiratory_support_admission,
+    tech_assistance_ever,
+    count_readmissions,
+    exptime,
+    # treatment history
+    vns_insertion_ever,
+    n_distinct_asm_index_admission = n_distinct_asm_admission,
+    adverse_effect_index_admission = adverse_effect_admission,
+    ketogenic_diet_admission,
+    quinidine_admission
+    )
+```
+
+```{r}
+#| label: sensitivity-analyses-merging-admissions-model-same-day
+#| echo: false
+
+nb_model_sensit_df_same_day <- readmissions_merged_same_day_df %>%
+  # select variables of interest
+  dplyr::select(
+    - admission_age_days_firstDate,
+    - admission_age_days_lastDate
+  ) %>%
+  # drop levels to remove those with no observations (e.g.patient uuid)
+  droplevels() 
+```
+
+```{r}
+#| label: sensitivity-analyses-merging-admissions-model-same-day-structure
+#| echo: false
+#| results: false
+
+# Print the structure of the merged dataframe
+str(nb_model_sensit_df_same_day)
+```
+
+### NB minimal - Linear age (RI + RS)
+
+Pre and post modelling assumptions were checked (see [appendix](#appendix)).
+
+```{r}
+#| label: model-same-day-nb-minimal
+#| echo: false
+#| results: 'markup'
+
+nb_model_min_sensit_same_day <- glmmTMB(
+  count_readmissions ~
+    age_index_admission_yr +
+    offset(log(exptime)) + 
+    (1 + age_index_admission_yr | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_same_day
+)
+
+summary(nb_model_min_sensit_same_day)
+```
+
+```{r}
+#| label: model-same-day-nb-minimal-ri-only
+#| echo: false
+#| results: 'markup'
+
+nb_model_min_sensit_only_ri_same_day <- glmmTMB(
+  count_readmissions ~
+    age_index_admission_yr +
+    offset(log(exptime)) + 
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_same_day
+)
+
+summary(nb_model_min_sensit_only_ri_same_day)
+```
+
+### NB minimal model - Non-lineal structural form of time (RCS)
+
+```{r}
+#| label: nb-rcs-minimal-test-optimal-knots-sensit-same-day
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| warning: false
+
+#'the function has the control argument to help the model converge when
+#'testing the optimal number.
+optimal_knots_same_day <- suppressMessages(
+  test_knots_ns_glmmTMB(
+    data = nb_model_sensit_df_same_day,
+    predictor = "age_index_admission_yr",
+    response = "count_readmissions",
+    fixed_effects = NULL,
+    random_effect = "1 | patient_uuid",
+    offset_var = "exptime",
+    k_vec = c(3,4,5),
+    family = nbinom2(link = "log")
+  )
+)
+
+optimal_knots_same_day
+```
+
+The optimal number of knots was tested with the minimal model was 4 knots.
+
+```{r}
+#| label: number_knots-sensit-same-day
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| warning: false
+
+#' Defining knots for RCS
+#' default positions at quantiles 5th, 35th, 65th, and 95th
+knots_rcs_same_day <- attributes(rms::rcs(
+  nb_model_sensit_df_same_day$age_index_admission_yr, 4))$parms
+
+# display knots location for age at index admission
+paste0("Knots for age at index admission (years): ",
+       paste(round(knots_rcs_same_day, 2), collapse = ", "))
+```
+
+```{r}
+#| label: model-same-day-nb-rcs-minimal
+#| echo: false
+
+# fit the stepwise model with merged admissions for same day of discharge
+nb_model_rcs_min_sensit_same_day <- glmmTMB(
+  count_readmissions ~ 
+    ns(age_index_admission_yr, 
+       knots = knots_rcs_same_day[2:3], # internal knots
+       Boundary.knots = c(knots_rcs_same_day[1], knots_rcs_same_day[4])) + # boundary knots
+    offset(log(exptime)) + 
+    (1 | patient_uuid),
+  data = nb_model_sensit_df_same_day,
+  family = nbinom2(link = "log"),
+  # add control to help convergence issues
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS")
+  ))
+
+summary(nb_model_rcs_min_sensit_same_day)
+```
+
+### Comparing performance of minimal models
+
+```{r}
+#| label: tbl-nb-performance-comparison-minimal-sensit-same-day
+#| tbl-cap: "Comparing performance of minimal models based on differernt performance indices"
+#| echo: false
+#| results: 'markup'
+
+compare_performance(nb_model_min_sensit_same_day, # full model
+                    nb_model_min_sensit_only_ri_same_day, # only random intercept
+                    nb_model_rcs_min_sensit_same_day) # with restricted cubic splines
+```
+
+The model with RCS improved the model fit compared to the minimal model without RCS (@tbl-nb-performance-comparison-minimal-sensit-same-day) and it has satisfied the modelling assumptions (see [appendix](#appendix)). Therefore, the model with RCS was used for further analysis.
+
+### Covariate selection
+
+The same process as described in the main analyses was repeated for this sensitivity analysis.
+
+##### Automatic stepwise selection
+
+```{r}
+#| label: nb-main-model-stepwise-automatic-sensit-same-day
+#| echo: false
+#| eval: false
+#| warning: false
+#| message: false
+
+stepwise_backward_test_same_day <- buildmer::buildglmmTMB(
+  #' keep the same full list stated when maximal feasible model was built as
+  #' the order step will be applied again
+  f,
+  data = nb_model_sensit_df_same_day,
+  family = nbinom2(link = "log"),
+  buildmerControl = buildmerControl(
+    # forced terms
+    include = ~ ns(age_index_admission_yr,
+      knots = knots_rcs_same_day[2:3],
+      Boundary.knots = c(
+        knots_rcs_same_day[1], knots_rcs_same_day[4])) +
+      sex + offset(log(exptime)) + (1 | patient_uuid),
+    #' Note: 'order' had been specified again due to the 'backward' alone
+    #' removed the forced terms.
+    direction = c("order", "backward"),
+    #' Criterion used to test terms for their contribution to the model fit
+    crit = "AIC",
+    #' Criterion used to test terms for elimination in the elimination step
+    elim = "AIC",
+    #' it was added due to convergence issues in the minimal model 
+    #' when adding var sex.
+    args = list(control = glmmTMBControl(
+      optimizer = optim,
+      optArgs = list(method = "BFGS")
+    ))
+  )
+)
+```
+
+```{r}
+#| label: nb-main-model-stepwise-automatic-sensit-same-day-print
+#| echo: false
+#| warning: false
+#| results: 'markup'
+#| message: false
+# note: the output was saved in r rds file as takes time to run
+# dir.create("~/RWE-rare_disease/Hospitalizations/output/rds_data")
+#saveRDS(stepwise_backward_test_same_day, "rds_data/automatic_stepwise_backward_test_same_day.rds")
+
+# Load the saved stepwise backward test file
+stepwise_backward_test_same_day_file <- readRDS("rds_data/automatic_stepwise_backward_test_same_day.rds")
+
+# assing the formula from the stepwise backward test
+automatic_backward_stepwise_same_day <- formula(stepwise_backward_test_same_day_file@model)
+
+# print the formula
+automatic_backward_stepwise_same_day
+```
+
+The automatic backward stepwise selection procedure removed five covariates from the maximal feasible model: `vns_insertion_ever`, `neonatal_onset`, `tech_assistance_ever`, `n_distinct_asm_index_admission` and `ketogenic_diet_admission`.
+
+```{r}
+#| label: nb-rcs-stepwise-automatic-selection-same-day
+#| echo: false
+#| results: 'markup'
+
+nb_model_rcs_stepwise_sensit_same_day <- glmmTMB(
+  # formula from the automatic stepwise selection
+  formula = automatic_backward_stepwise_same_day,
+  data = nb_model_sensit_df_same_day,
+  family = nbinom2(link = "log")
+)
+
+summary(nb_model_rcs_stepwise_sensit_same_day)
+```
+
+The robustness of the stepwise selection results was further evaluated through model averaging across all possible covariate combinations (see [appendix](#appendix)).This assessment confirmed the stepwise model (`nb_model_rcs_stepwise_sensit_same_day`) as the an appropriate **main effects model** for subsequent analyses.
+
+The obtained main effects model retained the following covariates: `sex`, `age_index_admission_yr`, `other_epilepsy_mutations`, `recurrent_variant`, `adverse_effect_index_admission`, `length_of_index_stay_days_cat`, `quinidine_admission`, `respiratory_support_index_admission` and `seizure_related_index_admission`.
+
+### Testing inteaction terms
+
+The interaction terms were added one by one to the main effects model obtained in the previous step, and the goodness of fit was assessed using AIC and the LRT to compare the model without interaction terms as performed for the main analyses.
+
+#### Age at index admission with sex
+
+```{r}
+#| label: interaction-terms-sex-age-same-day
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+nb_model_rcs_int_sex_age_same_day <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) + 
+    ns(age_index_admission_yr,  
+    knots = knots_rcs_same_day[2:3], Boundary.knots = c(knots_rcs_same_day[1],  
+        knots_rcs_same_day[4]))*sex +
+    length_of_index_stay_days_cat + 
+    other_epilepsy_mutations +
+    adverse_effect_index_admission + 
+    recurrent_variant + 
+    seizure_related_index_admission +
+    quinidine_admission + 
+    respiratory_support_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_same_day,
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS")
+  )
+)
+
+# the interaction does not significantly improves the goodness of fit of the model.
+anova(nb_model_rcs_stepwise_sensit_same_day, nb_model_rcs_int_sex_age_same_day)
+```
+
+#### Age at index admission with length of index stay
+
+```{r}
+#| label: interaction-terms-age-lohs-same-day
+#| echo: false
+#| results: 'markup'
+
+nb_model_rcs_int_age_lohs_same_day <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) + 
+    ns(age_index_admission_yr,  
+    knots = knots_rcs_same_day[2:3], Boundary.knots = c(knots_rcs_same_day[1],  
+        knots_rcs_same_day[4]))*length_of_index_stay_days_cat +
+    sex +
+    other_epilepsy_mutations +
+    adverse_effect_index_admission +
+    recurrent_variant + 
+    seizure_related_index_admission +
+    quinidine_admission + 
+    respiratory_support_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_same_day
+)
+
+# the interaction does not significantly improves the goodness of fit of the model.
+anova(nb_model_rcs_stepwise_sensit_same_day, nb_model_rcs_int_age_lohs_same_day)
+```
+
+#### Age at index admission with seizure-related index admission
+
+```{r}
+#| label: interaction-terms-age-sr-same-day
+#| echo: false
+#| results: 'markup'
+
+nb_model_rcs_int_age_sr_same_day <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) + 
+    ns(age_index_admission_yr,  
+    knots = knots_rcs_same_day[2:3], Boundary.knots = c(knots_rcs_same_day[1],  
+        knots_rcs_same_day[4]))*seizure_related_index_admission +
+    sex +
+    length_of_index_stay_days_cat +
+    other_epilepsy_mutations +
+    adverse_effect_index_admission +
+    recurrent_variant +
+    quinidine_admission + 
+    respiratory_support_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_same_day,
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS")
+  )
+)
+
+# the interaction significantly improves the goodness of fit of the model (0.01806 *)
+anova(nb_model_rcs_stepwise_sensit_same_day, nb_model_rcs_int_age_sr_same_day) 
+```
+
+#### Age at index admission with quinidine treatment during index admission
+
+```{r}
+#| label: interaction-terms-age-quinidine-same-day
+#| echo: false
+#| results: 'markup'
+
+nb_model_rcs_int_age_quinid_same_day <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) + 
+    ns(age_index_admission_yr,  
+    knots = knots_rcs_same_day[2:3], Boundary.knots = c(knots_rcs_same_day[1],  
+        knots_rcs_same_day[4]))*quinidine_admission +
+    sex +
+    length_of_index_stay_days_cat +
+    other_epilepsy_mutations +
+    adverse_effect_index_admission +
+    recurrent_variant +
+    seizure_related_index_admission +
+    respiratory_support_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_same_day)
+
+# the interaction does not converges even with control arguments added
+anova(nb_model_rcs_stepwise_sensit_same_day, nb_model_rcs_int_age_quinid_same_day) 
+```
+
+One covariate had an interaction with `age_index_admission_yr` that significantly (p \< 0.05) improved the goodness of fit of the model:
+
+-   `age_index_admission_yr`\*`seizure_related_index_admission`
+
+After discussing with epidemiologists, it was recommended at first instance to include only the interaction between `age_index_admission_yr` and `seizure_related_index_admission` in the model due to the clinical relevance. Further discussions will be held to decide if to include also other interactions.
+
+The **preliminary final model**, which included the interaction terms, was fitted as follows:
+
+```{r}
+#| label: nb-model-stepwise-interactions-same-day
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+nb_model_rcs_stepwise_sensit_same_day_interactions <- glmmTMB(
+  count_readmissions ~
+    offset(log(exptime)) +
+    ns(age_index_admission_yr,
+      knots = knots_rcs_same_day[2:3],
+      Boundary.knots = c(
+        knots_rcs_same_day[1],
+        knots_rcs_same_day[4]))*seizure_related_index_admission +
+    sex +
+    length_of_index_stay_days_cat +
+    other_epilepsy_mutations +
+    adverse_effect_index_admission +
+    recurrent_variant +
+    quinidine_admission +
+    respiratory_support_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_same_day,
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS")
+  )
+)
+
+summary(nb_model_rcs_stepwise_sensit_same_day_interactions)
+```
+
+##### Comparing performance
+
+```{r}
+#| label: tbl-nb-performance-comparison-interaction-no-interactions-same-day
+#| tbl-cap: "Comparing performance of models with and without interaction terms"
+#| echo: false
+#| results: 'markup'
+
+compare_performance(nb_model_rcs_stepwise_sensit_same_day, # full model
+                    nb_model_rcs_stepwise_sensit_same_day_interactions) # with restricted cubic splines
+```
+
+The model with the interaction terms had a lower AIC than the model without interaction terms.
+
+The model with the interaction terms was selected as the **final model** for the sensitivity analyses. It has converged properly and satisfied the model assumptions (see [appendix](#appendix)).
+
+:::
+
+### Statistical ouptus
+
+#### Overall effects of covariates on the rate of 30-day UHR per index admission
+
+```{r}
+#| label: tbl-regression_final-same-day
+#| tbl-cap: "Adjusted incidence rate ratios (IRRs) for 30-day UHRs for final multivariable model (fixed effects)."
+#| echo: false
+#| results: 'markup'
+
+table_regression_nb_same_day <- tbl_regression(
+  # final selected model
+  nb_model_rcs_stepwise_sensit_same_day_interactions, 
+  exponentiate = TRUE,
+  conf.level = 0.95,
+  label = list(
+    sex = "Sex",
+    other_epilepsy_mutations = "Other epilepsy mutations",
+    recurrent_variant = "Recurrent variant",
+    length_of_index_stay_days_cat = "Length of index hospital stay",
+    tech_assistance_ever = "History of technology assistance at index admission",
+    adverse_effect_index_admission = "Adverse effect during index admission",
+    quinidine_admission = "Quinidine treatment during index admission",
+    respiratory_support_index_admission = "Respiratory support during index admission"
+  ),
+    # remove issue with group(cond) column
+  tidy_fun = function(x, ...) {
+    broom.mixed::tidy(x, component = "cond", ...) %>%
+      dplyr::select(-component)   
+  }) %>%
+  # Rename estimate column to IRR
+  modify_header(estimate = "**IRR**") %>%
+  # Remove p-values cleanly
+  modify_table_body(~ dplyr::select(., -p.value)) %>%
+  bold_labels() %>%
+  italicize_levels()
+
+# Rename levels for binary variables
+table_regression_nb_same_day$table_body <- table_regression_nb_same_day$table_body %>%
+  mutate(label = case_when(
+    label == "0" ~ "No",
+    label == "1" ~ "Yes",
+    label == "male" ~ "Male",
+    label == "female" ~ "Female",
+    TRUE ~ label
+  ))
+
+# Remove the spline rows explicitly
+table_regression_nb_same_day$table_body <- table_regression_nb_same_day$table_body %>%
+  filter(
+    !str_detect(variable, "^ns\\(age_index_admission_yr") &
+    !str_detect(variable, "seizure_related_index_admission") &
+    !str_detect(variable, "patient_uuid")
+  )
+
+# Print the table with kableExtra
+tbl_regression_nb_same_day <- table_regression_nb_same_day %>%
+  modify_footnote(
+    estimate ~ paste(
+      "IRR = Incidence Rate Ratio. IRR > 1 indicates a higher rate of 30-day UHRs; IRR < 1 indicates a lower rate.",
+      "For categorical predictors, IRRs compare each level with the reference category.",
+      "For continuous predictors, IRRs correspond to the rate change per 1-unit increase in the predictor.",
+      "Estimates are adjusted for all variables in the model. Nonlinear spline terms and random-effect estimates are not reported.",
+      sep = " "
+    )
+  ) %>%
+  as_flex_table() %>%
+  flextable::font(fontname = "Century Gothic", part = "all") %>%
+  flextable::fontsize(size = 11, part = "all") %>%
+  flextable::fontsize(part = "footer", size = 9) %>%  
+  flextable::autofit()
+
+tbl_regression_nb_same_day
+```
+
+#### Marginal means estimations
+
+##### Main effect of age at index admission
+
+###### Table: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: tbl-emmeans-table-sensit-same-day
+#| tbl-cap: "Overall estimated marginal means of the number of 30-day UHR per 100 index admissions."
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+# Build the reference grid explicitly
+grid_emmeans_full_same_day <- ref_grid(
+  nb_model_rcs_stepwise_sensit_same_day_interactions,
+  at = list(age_index_admission_yr = age_seq), # age seq as defined in main analyses
+  non.nuisance = "age_index_admission_yr", # do not average
+  params = "knots_rcs_same_day",  # state knot values for the splines model
+  weights = "equal" # weights assumed equal
+)
+
+# Define total standard deviation for bias adjustment (only random is given)
+cor_random_mod_same_day <- lme4::VarCorr(
+  nb_model_rcs_stepwise_sensit_same_day_interactions)
+total_sd_same_day <- sapply(
+  cor_random_mod_same_day$cond, function(x) attr(x, "stddev"))
+
+#' Model with offset, weights assumed equal
+readmissions_by_age_same_day <- emmeans(
+  grid_emmeans_full_same_day, ~ age_index_admission_yr,
+  type = "response",  
+  offset = mean(log(nb_model_sensit_df_same_day$exptime)),
+  bias.adjust = TRUE, # apply bias adjustment
+  sigma = total_sd_same_day # total standard deviation for bias adjustment
+  )
+
+# Convert the emmeans object to a regular dataframe
+readmissions_by_age_same_day_df <- as.data.frame(readmissions_by_age_same_day)
+
+# View the updated dataframe
+tbl_readmissions_by_age_same_day_df <- readmissions_by_age_same_day_df %>%
+  mutate(
+    combined = sprintf(
+      "%.1f (%.1f; %.1f)",
+      response * 100, asymp.LCL * 100, asymp.UCL * 100
+    )
+  ) %>%
+  dplyr::select(age_index_admission_yr, combined) %>%
+  rename(
+    "Age at index admission (years)" = age_index_admission_yr,
+    "Number of 30-day UHRs per 100 index admissions (95% CI)" = combined
+  ) %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(values = c(
+    "Note 1: the endpoint was scaled to 100 index admissions as standard practice to facilitate interpretation.",
+    "Note 2: results indicate, at each age, how many 30-day unplanned readmissions would be expected for every 100 index admissions (or 100 discharges)."
+  )) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) %>%
+  flextable::align(j = 1, part = "all", align = "left") %>%
+  flextable::align(j = 2, part = "all", align = "center")
+
+tbl_readmissions_by_age_same_day_df
+```
+
+###### Graph: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: fig-emmeans-plot-years-plot-same-day
+#| fig-cap: "Fitted 30-day UHR number per 100 index admissions (black line) with 95% confidence intervals (grey shaded area), by patient age at index admission. Red dots indicate time points (6th, 12th , 18th and 28th months) at which the contrast pairwise analysis were conducted."
+#| echo: false
+#| results: 'asis'
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+#| out-width: 100%
+
+# plot the estimated marginal means across age at index admission by years
+fig_emmeans_same_day <- ggplot(readmissions_by_age_same_day_df, aes(x = age_index_admission_yr, 
+                                            y =  response * 100)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = asymp.LCL * 100, ymax = asymp.UCL * 100), alpha = 0.2) +
+  geom_point(data = subset(readmissions_by_age_same_day_df, 
+                           age_index_admission_yr %in%
+                             c(0.5, 1, 1.5, 2)), 
+             aes(x = age_index_admission_yr, y =  response * 100),
+             color = "red", size = 1.5) +
+  labs(
+    x = "Patient age (years)",
+    y = "Number of 30-day UHRs per 100 index admissions"
+  ) +
+  scale_x_continuous(breaks = seq(0, 18, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 200, by = 25)) +
+  coord_cartesian(ylim = c(0, max(readmissions_by_age_same_day_df$asymp.UCL*100, na.rm = TRUE))) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 9, face = "bold"),
+    axis.text.y = element_text(size = 9, face = "bold", margin = margin(r = -10)),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    legend.title = element_text(size = 11),
+    legend.position = "bottom",
+    legend.text = element_text(size = 11)
+  )
+
+fig_emmeans_same_day
+```
+
+###### Contrast for time points of interest
+
+```{r}
+#| label: tbl-contrast-time-points-same-day
+#| tbl-cap: "Pairwise contrast for time-points of interest (6, 12, 18, and 24 months)"
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+# obtain time point of interest to compare from the total emmeans grid
+emm_subset_nb_full_model_int_same_day <- subset(readmissions_by_age_same_day, 
+                                   age_index_admission_yr %in% c(0.5, 1, 1.5, 2))
+
+# time point comparison
+# pairs(emm_subset) # simplified version of contrast function with same results
+contrast_nb_full_model_int_same_day <- emmeans::contrast(
+  emm_subset_nb_full_model_int_same_day,
+  method = "pairwise",
+  ref = 1, # reference is 0.5 years
+  adjust = "tukey"
+)
+
+
+tbl_contrast_nb_full_model_int_same_day <- contrast_nb_full_model_int_same_day %>%
+  as.data.frame() %>%
+  dplyr::select(-c("df", "null", "z.ratio")) %>%
+  transmute(
+    `Contrasted time-points (years)` =
+      str_squish(str_replace_all(contrast, c("age_index_admission_yr" = "", "/" = " vs "))),
+    Ratio = ratio,
+    SE = SE,
+    `P value` = case_when(
+      p.value < 1e-4 ~ "< 0.0001",
+      p.value < 0.05 ~ "< 0.05",
+      TRUE ~ sprintf("%.3f", p.value)
+    )
+  ) %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::colformat_double(j = c("Ratio", "SE"), digits = 2) %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(
+    values = c(
+      "Note 1: Tukey-adjusted wald tests performed on the log scale, based on the asymptotic distribution of the estimates.",
+      "Note 2: P-values < 0.05 indicate that the predicted number of 30-day UHRs at the contrasted time points were significantly different."
+    )
+  ) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9)  
+
+tbl_contrast_nb_full_model_int_same_day
+```
+
+##### Interaction effect of age at index admission and seizure-related index admission
+
+###### Table: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: tbl-emmeans-table-interactions-sensit-same-day-sr
+#| tbl-cap: "Estimated marginal means of the number of 30-day UHR per 100 index admissions by selected time points for seizure-related and non-seizure related index admissions."
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+grid_by_seizure_same_day <- ref_grid(
+  nb_model_rcs_stepwise_sensit_same_day_interactions,
+  at = list(age_index_admission_yr = age_seq),
+  # do not average the interaction terms to get the values per time point
+  non.nuisance = c("age_index_admission_yr", "seizure_related_index_admission"), 
+  params = "knots_rcs_same_day",
+  weights = "equal"
+)
+
+readmissions_by_age_int_same_day_sr <- emmeans(
+  # add the interaction term to the grid
+  grid_by_seizure_same_day, ~ age_index_admission_yr | seizure_related_index_admission,
+  type = "response", 
+  offset = mean(log(nb_model_sensit_df_same_day$exptime)),
+  bias.adjust = TRUE, # apply bias adjustment
+  sigma = total_sd_same_day # total standard deviation for bias adjustment
+  )
+
+# Convert the emmeans object to a regular dataframe
+readmissions_by_age_int_same_day_sr_df <- as.data.frame(readmissions_by_age_int_same_day_sr)
+
+# View the updated dataframe
+tbl_readmissions_by_age_int_same_day_sr_df <- readmissions_by_age_int_same_day_sr_df %>%
+  mutate(
+    grp = ifelse(seizure_related_index_admission == 1, "SR", "NSR"),
+    num = round(response * 100, 1),
+    CI  = sprintf("(%.1f; %.1f)", asymp.LCL * 100, asymp.UCL * 100)
+  ) %>%
+  mutate(val = paste0(num, " ", CI)) %>%
+  dplyr::select(age = age_index_admission_yr, grp, val) %>%
+  tidyr::pivot_wider(names_from = grp, values_from = val) %>%
+  dplyr::rename(
+    `Age at index admission (years)` = age,
+    `Seizure-related` = SR,
+    `Non-seizure-related` = NSR
+  ) %>%
+  # ensure column order: Age | Seizure-related | Non-seizure-related
+  dplyr::select(`Age at index admission (years)`,
+                `Seizure-related`,
+                `Non-seizure-related`) %>%
+  flextable::flextable() %>%
+  # second header row (default) labels
+  flextable::set_header_labels(
+    `Age at index admission (years)` = "Age at index admission (years)",
+    `Seizure-related` = "Seizure-related",
+    `Non-seizure-related` = "Non-seizure-related"
+  ) %>%
+  # add top header row: first cell blank over Age, second cell spans the two strata
+  flextable::add_header_row(
+    values = c("", "Number of 30-day UHR per 100 index admissions (95% CI)"),
+    colwidths = c(1, 2)
+  ) %>%
+  # styling
+  flextable::align(part = "header", align = "center") %>%
+  flextable::autofit() %>%
+  flextable::add_footer_lines(
+  values = c(
+    "Note 1: the endpoint was scaled to 100 index admissions as standard practice to facilitate interpretation.",
+    "Note 2: results indicate, at each age, the expected number of 30-day unplanned readmissions per 100 index admissions (or 100 discharges), shown separately for seizure-related and non–seizure-related index admissions."
+  )) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::align(j = 1, part = "all", align = "left") %>%
+  flextable::align(j = 2:3, part = "body", align = "center")
+
+tbl_readmissions_by_age_int_same_day_sr_df
+```
+
+###### Graph: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: fig-emmeans-plot-years-plot-interaction-sensit-same-day-sr
+#| fig-cap: "Fitted of number 30-day UHR per 100 index admissions (discharges) for seizure related and non-seizure related admissions (solid line) with 95% confidence intervals (shaded area), by patient age at index admission in years. Red dots indicate time points (6th, 12th , 18th and 28th months) at which the contrast pairwise analysis were conducted"
+#| echo: false
+#| results: 'asis'
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+#| out-width: 100%
+
+readmissions_by_age_int_same_day_sr_df_plot <- readmissions_by_age_int_same_day_sr_df %>%
+  mutate(
+    seizure_related_index_admission =
+      factor(seizure_related_index_admission, 
+             labels = c("Non-seizure-related", "Seizure-related")))
+
+#' plot the estimated marginal means across age at index admission by years 
+#' with strata term
+fig_emmeans_int_sr_same_day <- ggplot(readmissions_by_age_int_same_day_sr_df_plot, aes(
+  x = age_index_admission_yr,
+  y = response * 100,
+  colour = seizure_related_index_admission,
+  fill   = seizure_related_index_admission)) +
+  geom_ribbon(aes(ymin = asymp.LCL * 100, ymax = asymp.UCL * 100), alpha = 0.18, colour = NA) +
+  geom_line(size = 1.1) +
+  geom_point(
+    data = subset(readmissions_by_age_int_same_day_sr_df_plot,
+                  age_index_admission_yr %in% c(0.5, 1, 1.5, 2)), 
+    aes(x = age_index_admission_yr, y = response * 100),
+    color = "red", size = 1.5,
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  labs(
+    x = "Patient age (years)",
+    y = "Number of 30-day UHRs per 100 index admissions",
+    colour = "Type of admission diagnosis", 
+    fill   = "Type of admission diagnosis"
+  ) +
+  scale_x_continuous(breaks = seq(0, 18, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 200, by = 25)) +
+  coord_cartesian(ylim = c(0, max(readmissions_by_age_int_same_day_sr_df_plot$asymp.UCL * 100, na.rm = TRUE))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(size = 9, face = "bold"),
+    axis.text.y = element_text(size = 9, face = "bold", margin = margin(r = -10)),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    legend.title = element_text(size = 11),
+    legend.position = "bottom",
+    legend.text = element_text(size = 11)
+  )
+
+fig_emmeans_int_sr_same_day
+```
+
+###### Contrast between time points of interest
+
+```{r}
+#| label: tbl-contrast-time-points-model-nb-int-sr-same-day
+#| tbl-cap: "Pairwise contrast for time-points of interest (6, 12, 18, and 24 months) with interaction term"
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+# obtain time point of interest to compare from the total emmeans grid
+emm_subset_nb_model_int_same_day_sr <- subset(readmissions_by_age_int_same_day_sr, 
+                                   age_index_admission_yr %in% c(0.5, 1, 1.5, 2))
+
+# time point comparison
+contrast_nb_model_int_same_day_sr <- emmeans::contrast(
+  emm_subset_nb_model_int_same_day_sr,
+  method = "pairwise", 
+  # reference is 0.5 years
+  ref = 1,
+  # keeps comparisons within each level
+  by = "seizure_related_index_admission",
+  adjust = "tukey") 
+
+tbl_contrast_nb_model_int_same_day_sr <- contrast_nb_model_int_same_day_sr %>%
+  as.data.frame() %>%
+  transmute(
+    # Clean the contrast labels from the age term and make it "a vs b"
+    `Contrasted time-points (years)` =
+      str_squish(str_replace_all(contrast, c("age_index_admission_yr" = "", "/" = " vs "))),
+    `Type of admission diagnosis` = factor(
+      seizure_related_index_admission,
+      levels = c(0, 1),
+      labels = c("Non-seizure-related", "Seizure-related")),
+    Ratio = ratio,
+    SE = SE,
+    `P value` = case_when(
+      p.value < 1e-4 ~ "< 0.0001",
+      p.value < 0.05 ~ "< 0.05",
+      TRUE ~ sprintf("%.3f", p.value)
+    )
+  ) %>%
+  flextable::regulartable() %>%
+  flextable::colformat_double(j = c("Ratio", "SE") , digits = 2) %>%
+  flextable::autofit() %>%
+  flextable::add_footer_lines(
+    values = c(
+      "Note 1: Tukey-adjusted wald tests performed on the log scale, based on the asymptotic distribution of the estimates.",
+      "Note 2: P-values < 0.05 indicate that the predicted number of 30-day UHRs at the contrasted time points were significantly different."
+    )
+  ) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) %>%
+  flextable::bold(part = "header", bold = TRUE)
+  
+tbl_contrast_nb_model_int_same_day_sr
+```
+
+## Sensitivity analysis (II): Merging hospital admission records occurring on the day after last discharge
+
+::: {.content-visible when-format="html"}
+
+```{r}
+#| label: sensitivity-analyses-merging-admissions-next-day-rename
+#| echo: false
+#| warning: false
+
+# Select, order and rename variables for readmission df
+#' Note: readmission variable used to filter the desired subset of data
+#' was derived in the data management file
+readmissions_merged_next_day_df <- hospitalizations_merged_next_day_df %>%
+  #' keep index with valid exptime and remove those with invalid index 
+  #' admission which doens't allow to count readmissions (i.e. exptime == 0)
+  #' Index derived in the data management file already excludes planned, birth
+  #'  and outpatient admissions
+  filter(readmission == "index" & !is.na(count_readmissions)) %>%
+  # order, rename and select variables of interest
+  dplyr::select(
+    # patient identifier
+    patient_uuid,
+    # admissions related features
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    # demographics
+    sex,
+    age_index_admission_yr = age_admission_yr,
+    # genetic mutations
+    other_epilepsy_mutations,
+    recurrent_variant,
+    neonatal_onset,
+    # clinical history
+    seizure_related_index_admission = seizure_related_admission,
+    length_of_index_stay_days_cat = length_of_stay_days_cat,
+    respiratory_support_index_admission = respiratory_support_admission,
+    tech_assistance_ever,
+    count_readmissions,
+    exptime,
+    # treatment history
+    vns_insertion_ever,
+    n_distinct_asm_index_admission = n_distinct_asm_admission,
+    adverse_effect_index_admission = adverse_effect_admission,
+    ketogenic_diet_admission,
+    quinidine_admission
+    )
+```
+
+```{r}
+#| label: sensitivity-analyses-merging-admissions-model-next-day
+#| echo: false
+
+nb_model_sensit_df_next_day <- readmissions_merged_next_day_df %>%
+  # select variables of interest
+  dplyr::select(
+    - admission_age_days_firstDate,
+    - admission_age_days_lastDate
+  ) %>%
+  # drop levels to remove those with no observations
+  droplevels() 
+```
+
+```{r}
+#| label: sensitivity-analyses-merging-admissions-model-next-day-structure
+#| echo: false
+#| results: false
+
+str(nb_model_sensit_df_next_day)
+```
+
+### NB minimal - Linear age (RI + RS)
+
+Pre and post modelling assumptions were checked (see [appendix](#appendix)).
+
+```{r}
+#| label: model-next-day-nb-minimal
+#| echo: false
+#| results: 'markup'
+
+#' it couldn't converge with the RS even with control arguments added
+nb_model_min_sensit_next_day <- glmmTMB(
+  count_readmissions ~
+    age_index_admission_yr +             
+    offset(log(exptime)) + 
+    (1 + age_index_admission_yr | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_next_day
+)
+
+summary(nb_model_min_sensit_next_day)
+```
+
+```{r}
+#| label: model-next-day-nb-minimal-ri-only
+#| echo: false
+#| results: 'markup'
+
+#' it couldn't converge with the RS even with control arguments added
+nb_model_min_sensit_only_ri_next_day <- glmmTMB(
+  count_readmissions ~
+    age_index_admission_yr +             
+    offset(log(exptime)) + 
+    (1 | patient_uuid), # random slope was removed
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_next_day
+)
+
+summary(nb_model_min_sensit_only_ri_next_day)
+```
+
+### NB minimal model - Non-lineal structural form of time (RCS)
+
+```{r}
+#| label: nb-rcs-minimal-test-optimal-knots-sensit-next-day
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| warning: false
+
+optimal_knots_next_day <- suppressMessages(
+  test_knots_ns_glmmTMB(
+    data = nb_model_sensit_df_next_day,
+    predictor = "age_index_admission_yr",
+    response = "count_readmissions",
+    fixed_effects = NULL, # without covariates
+    random_effect = "1 | patient_uuid",
+    offset_var = "exptime",
+    k_vec = c(3,4,5),
+    family = nbinom2(link = "log")
+  )
+)
+
+optimal_knots_next_day
+```
+
+The optimal number of knots for the sensitivity analyses population with merged admissions on the next day of discharge was 3, as it had the lowest AIC value. Similar results were obtained when tested the optimal number with all covariates.
+
+```{r}
+#| label: number_knots-sensit-next-day
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| warning: false
+
+#' Defining knots for RCS:
+#' default position of knots based on quantiles 25%, 50% and 75%
+knots_rcs_next_day <- attributes(rcs(
+  nb_model_sensit_df_next_day$age_index_admission_yr, 3))$parms
+
+# display knots location for age at index admission
+paste0("Knots for age at index admission (years): ",
+       paste(round(knots_rcs_next_day, 2), collapse = ", "))
+```
+
+```{r}
+#| label: model-next-day-nb-rcs-full
+#| echo: false
+
+# fit the stepwise model with merged admissions for same day of discharge
+nb_model_rcs_min_sensit_next_day <- glmmTMB(
+  count_readmissions ~ 
+    ns(age_index_admission_yr, 
+        knots = knots_rcs_next_day[2], # internal knot
+        Boundary.knots = c(knots_rcs_next_day[1], knots_rcs_next_day[3])) + # boundary knots
+    offset(log(exptime)) + 
+    (1 | patient_uuid),
+  data = nb_model_sensit_df_next_day,
+  family = nbinom2(link = "log")
+  )
+
+summary(nb_model_rcs_min_sensit_next_day)
+```
+
+### Comparing performance of minimal models
+
+```{r}
+#| label: tbl-nb-performance-comparison-minimal-sensit-next-day
+#| tbl-cap: "Comparing performance of minimal models based on differernt performance indices"
+#| echo: false
+#| results: 'markup'
+
+compare_performance(nb_model_min_sensit_next_day, # with random slope and intercept
+                    nb_model_min_sensit_only_ri_next_day, # only random intercept
+                    nb_model_rcs_min_sensit_next_day) # with restricted cubic splines
+```
+
+The model with RCS improved the model fit compared to the minimal model without RCS (@tbl-nb-performance-comparison-minimal-sensit-next-day) and it has satisfied the modelling assumptions (see [appendix](#appendix)). Therefore, the model with RCS was used as basis for further analysis.
+
+### Covariate selection
+
+The same set of covariates as in the main analyses were considered for this sensitivity analyses.
+
+##### Automatic stepwise selection
+
+```{r}
+#| label: nb-main-model-stepwise-automatic-sensit-next-day
+#| echo: false
+#| warning: false
+#| eval: false
+#| message: false
+
+stepwise_backward_test_next_day <- buildmer::buildglmmTMB(
+  #' formula mentioned in the main analyses
+  f, 
+  data = nb_model_sensit_df_next_day,
+  family = nbinom2(link = "log"),
+  buildmerControl = buildmerControl(
+    # forced terms
+    include = ~ ns(age_index_admission_yr, 
+                   knots = knots_rcs_next_day[2],
+                   Boundary.knots = c(knots_rcs_next_day[1],
+                                      knots_rcs_next_day[3])) +
+      sex + offset(log(exptime)) + (1 | patient_uuid),
+    #' order step to reach first the maximal feasible model and then eliminate
+    #'  terms in backward direction
+    direction = c('order', 'backward'), 
+    #' Criterion used to test terms for their contribution to the model fit
+    crit = 'AIC',
+    #' Criterion used to test terms for elimination in the elimination step
+    elim = 'AIC',
+    #' glmmTMB's control here to pass the lack of convergence when adding 
+    #' sex to the minimal
+    args = list(control = glmmTMBControl(
+      optimizer = optim,
+      optArgs = list(method = "BFGS")
+    ))
+  )
+)
+```
+
+```{r}
+#| label: nb-main-model-stepwise-automatic-sensit-next-day-print-formula
+#| echo: false
+#| warning: false
+#| results: 'markup'
+#| message: false
+
+# note: the output was saved in r rds file as takes time to run
+# dir.create("~/RWE-rare_disease/Hospitalizations/output/rds_data")
+#saveRDS(stepwise_backward_test_next_day, "rds_data/stepwise_backward_test_next_day.rds")
+
+# Load the saved stepwise backward test file
+stepwise_backward_test_next_day_file <- readRDS("rds_data/stepwise_backward_test_next_day.rds")
+
+# assign the formula from the stepwise backward test
+automatic_backward_stepwise_next_day <- formula(stepwise_backward_test_next_day_file@model)
+
+# print the formula
+automatic_backward_stepwise_next_day
+```
+
+The automatic backward stepwise selection procedure removed six covariates from the maximal feasible model: `vns_insertion_ever`, `tech_assistance_ever`, `neonatal_onset`, `adverse_effect_index_admission`, `quinidine_admission` and `ketogenic_diet_admission`.
+
+```{r}
+#| label: nb-rcs-stepwise-automatic-selection-next-day
+#| echo: false
+#| results: 'markup'
+
+nb_model_rcs_stepwise_sensit_next_day <- glmmTMB(
+  # formula from the automatic stepwise selection
+  formula = automatic_backward_stepwise_next_day,
+  data = nb_model_sensit_df_next_day,
+  family = nbinom2(link = "log")
+)
+
+summary(nb_model_rcs_stepwise_sensit_next_day)
+```
+
+The robustness of the stepwise selection results was further evaluated through model averaging across all possible covariate combinations (see [appendix](#appendix)).This assessment confirmed the stepwise model (`nb_model_rcs_stepwise_sensit_next_day`) as the an appropriate **main effects model** for subsequent analyses.
+
+The final retained covariates were: `sex`, `age_index_admission_yr`, `other_epilepsy_mutations`, `recurrent_variant`, `length_of_index_stay_days_cat`, `respiratory_support_index_admission`, `n_distinct_asm_index_admission` and `seizure_related_index_admission`.
+
+### Testing inteaction terms
+
+The interaction terms were added one by one to the main effects model obtained in the previous step, and the goodness of fit was assessed using AIC and the LRT to compare the model without interaction terms as performed for the main analyses.
+
+#### Age at index admission with sex
+
+```{r}
+#| label: interaction-terms-sex-age-next-day
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+nb_model_rcs_int_sex_age_next_day <- glmmTMB(
+  count_readmissions ~ 
+    offset(log(exptime)) +
+    ns(age_index_admission_yr,  
+       knots = knots_rcs_next_day[2], 
+       Boundary.knots = c(knots_rcs_next_day[1], 
+                          knots_rcs_next_day[3]))*sex +
+    length_of_index_stay_days_cat +  
+    other_epilepsy_mutations + 
+    recurrent_variant + 
+    respiratory_support_index_admission +  
+    seizure_related_index_admission +
+    n_distinct_asm_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_next_day
+)
+
+# the interaction does not significantly improves the goodness of fit of the model.
+anova(nb_model_rcs_stepwise_sensit_next_day, nb_model_rcs_int_sex_age_next_day)
+```
+
+#### Age at index admission with length of index stay
+
+```{r}
+#| label: interaction-terms-age-lohs-next-day
+#| echo: false
+#| results: 'markup'
+
+nb_model_rcs_int_age_lohs_next_day <- glmmTMB(
+  count_readmissions ~ 
+    offset(log(exptime)) +
+    ns(age_index_admission_yr,  
+       knots = knots_rcs_next_day[2], 
+       Boundary.knots = c(knots_rcs_next_day[1], 
+                          knots_rcs_next_day[3]))*length_of_index_stay_days_cat +
+    sex +
+    other_epilepsy_mutations + 
+    recurrent_variant + 
+    respiratory_support_index_admission +  
+    seizure_related_index_admission +
+    n_distinct_asm_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_next_day
+)
+
+# the interaction does not significantly improves the goodness of fit of the model.
+anova(nb_model_rcs_stepwise_sensit_next_day, nb_model_rcs_int_age_lohs_next_day)
+```
+
+#### Age at index admission with seizure-related index admission
+
+```{r}
+#| label: interaction-terms-age-sr-next-day
+#| echo: false
+#| results: 'markup'
+
+nb_model_rcs_int_age_sr_next_day <- glmmTMB(
+  count_readmissions ~ 
+    offset(log(exptime)) +
+    ns(age_index_admission_yr,  
+       knots = knots_rcs_next_day[2], 
+       Boundary.knots = c(knots_rcs_next_day[1], 
+                          knots_rcs_next_day[3]))*seizure_related_index_admission +
+    sex +
+    length_of_index_stay_days_cat + 
+    other_epilepsy_mutations + 
+    recurrent_variant +
+    respiratory_support_index_admission +  
+    n_distinct_asm_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_next_day,
+  control = glmmTMBControl(
+    optimizer = optim, 
+    optArgs = list(method = "BFGS")
+))
+
+# the interaction does not significantly improves the goodness of fit of the model.
+anova(nb_model_rcs_stepwise_sensit_next_day , nb_model_rcs_int_age_sr_next_day) 
+```
+
+#### Age at index admission with number of ASMs at index admission
+
+```{r}
+#| label: interaction-terms-age-asm-next-day
+#| echo: false
+#| results: 'markup'
+
+nb_model_rcs_int_age_asm_next_day <- glmmTMB(
+  count_readmissions ~ 
+    offset(log(exptime)) +
+    ns(age_index_admission_yr,  
+       knots = knots_rcs_next_day[2], 
+       Boundary.knots = c(knots_rcs_next_day[1], 
+                          knots_rcs_next_day[3]))*n_distinct_asm_index_admission +
+    sex +
+    length_of_index_stay_days_cat + 
+    other_epilepsy_mutations + 
+    recurrent_variant +
+    respiratory_support_index_admission +  
+    seizure_related_index_admission +
+    (1 | patient_uuid),
+  family = nbinom2(link = "log"),
+  data = nb_model_sensit_df_next_day,
+  control = glmmTMBControl(
+    optimizer = optim, 
+    optArgs = list(method = "BFGS")
+))
+
+# the interaction significantly improves the goodness of fit of the model (0.005633 **).
+anova(nb_model_rcs_stepwise_sensit_next_day, nb_model_rcs_int_age_asm_next_day) 
+```
+
+Two interactions significantly (p \< 0.05) improved the goodness of fit of the model: the interaction between the interaction between `age_index_admission_yr` with `n_distinct_asm_index_admission`.
+
+Although the `age_admission_yr` x `number of ASMs at index admission` was statistically significant by LRT, the observed differences occurred mainly at older ages where very few patients were available for comparison. This resulted in unstable estimates with wide confidence intervals, limiting the reliability of the effect.
+
+Thus the **preliminary final model** and **final model** was the main effects model without interaction terms `nb_model_rcs_stepwise_sensit_next_day`.
+
+The final model has converged properly and satisfied the model assumptions (see [appendix](#appendix)).
+
+::: 
+
+### Statistical outputs
+
+#### Overall effects of covariates on the rate of 30-day UHR per index admission.
+
+```{r}
+#| label: tbl-regression_final-next-day
+#| tbl-cap: "Adjusted incidence rate ratios (IRRs) for 30-day UHRs for final multivariable model (fixed effects)."
+#| echo: false
+#| results: 'markup'
+
+table_regression_nb_next_day <- tbl_regression(
+  # final selected model
+  nb_model_rcs_stepwise_sensit_next_day, 
+  exponentiate = TRUE,
+  conf.level = 0.95,
+  label = list(
+    sex = "Sex",
+    other_epilepsy_mutations = "Other epilepsy mutations",
+    recurrent_variant = "Recurrent variant",
+    length_of_index_stay_days_cat = "Length of index hospital stay",
+    respiratory_support_index_admission = "Respiratory support during index admission",
+    seizure_related_index_admission = "Seizure-related index admission",
+    n_distinct_asm_index_admission = "Number of distinct ASMs during index admission"
+  ),
+  # remove issue with group(cond) column
+  tidy_fun = function(x, ...) {
+    broom.mixed::tidy(x, component = "cond", ...) %>%
+      dplyr::select(-component)   
+  }) %>%
+  # Rename estimate column to IRR
+  modify_header(estimate = "**IRR**") %>%
+  # Remove p-values cleanly
+  modify_table_body(~ dplyr::select(., -p.value)) %>%
+  bold_labels() %>%
+  italicize_levels()
+
+# Rename levels for binary variables
+table_regression_nb_next_day$table_body <- table_regression_nb_next_day$table_body %>%
+  mutate(label = case_when(
+    label == "0" ~ "No",
+    label == "1" ~ "Yes",
+    label == "male" ~ "Male",
+    label == "female" ~ "Female",
+    TRUE ~ label
+  ))
+
+# Remove the spline rows explicitly
+table_regression_nb_next_day$table_body <- table_regression_nb_next_day$table_body %>%
+  filter(!str_detect(variable, "^ns\\(age_index_admission_yr")) %>%
+  filter(!str_detect(variable, "patient_uuid"))
+
+# print the table as kable
+tbl_regression_nb_next_day <- table_regression_nb_next_day %>%
+  modify_footnote(
+    estimate ~ paste(
+      "IRR = Incidence Rate Ratio. IRR > 1 indicates a higher rate of 30-day UHRs; IRR < 1 indicates a lower rate.",
+      "For categorical predictors, IRRs compare each level with the reference category.",
+      "For continuous predictors, IRRs correspond to the rate change per 1-unit increase in the predictor.",
+      "Estimates are adjusted for all variables in the model. Nonlinear spline terms and random-effect estimates are not reported.",
+      sep = " "
+    )
+  ) %>%
+  as_flex_table() %>%
+  flextable::font(fontname = "Century Gothic", part = "all") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::fontsize(part = "footer", size = 9) %>%  
+  flextable::autofit()
+
+tbl_regression_nb_next_day
+```
+
+#### Marginal means estimations
+
+##### Main effect of age at index admission
+
+###### Table: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: tbl-emmeans-table-sensit-next-day
+#| tbl-cap: "Overall estimated marginal means of the number of 30-day UHR per 100 index admissions"
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+# Build the reference grid explicitly
+grid_emmeans_full_next_day <- ref_grid(
+  nb_model_rcs_stepwise_sensit_next_day,
+  at = list(age_index_admission_yr = age_seq), # age seq as defined in main analyses
+  non.nuisance = "age_index_admission_yr", # do not average
+  params = "knots_rcs_next_day",  # state knot values for the splines model
+  weights = "equal" # assume equal weights for the emmeans
+)
+
+# Define total standard deviation for bias adjustment (only random is given)
+cor_random_mod_next_day <- lme4::VarCorr(
+  nb_model_rcs_stepwise_sensit_next_day)
+total_sd_next_day <- sapply(cor_random_mod_next_day$cond, function(x) attr(x, "stddev"))
+
+#' Model with offset, weights assumed equal
+readmissions_by_age_next_day <- emmeans(
+  grid_emmeans_full_next_day, ~ age_index_admission_yr,
+  type = "response",  
+  offset = mean(log(nb_model_sensit_df_next_day$exptime)),
+  bias.adjust = TRUE,
+  sigma = total_sd_next_day
+  )
+
+# Convert the emmeans object to a regular dataframe
+readmissions_by_age_next_day_df <- as.data.frame(readmissions_by_age_next_day)
+
+# View the updated dataframe
+tbl_readmissions_by_age_next_day_df <- readmissions_by_age_next_day_df %>%
+  mutate(
+    combined = sprintf(
+      "%.1f (%.1f; %.1f)",
+      # Scaling up the number per 100 index with respective IC95%
+      response * 100, asymp.LCL * 100, asymp.UCL * 100
+    )
+  ) %>%
+  dplyr::select(age_index_admission_yr, combined) %>%
+  rename(
+    "Age at index admission (years)" = age_index_admission_yr,
+    "Number of 30-day UHRs per 100 index admissions (95% CI)" = combined
+  ) %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(values = c(
+    "Note 1: the endpoint was scaled to 100 index admissions as standard practice to facilitate interpretation.",
+    "Note 2: results indicate, at each age, how many 30-day unplanned readmissions would be expected for every 100 index admissions (or 100 discharges)."
+  )) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) %>%
+  flextable::align(j = 1, part = "all", align = "left") %>%
+  flextable::align(j = 2, part = "all", align = "center")
+
+tbl_readmissions_by_age_next_day_df
+```
+
+###### Graph: predicted 30-day UHR across age at index admission
+
+```{r}
+#| label: fig-emmeans-plot-years-plot-next-day
+#| fig-cap: "Fitted 30-day UHR number per 100 index admissions (black line) with 95% confidence intervals (grey shaded area), by patient age at index admission. Red dots indicate time points (6th, 12th , 18th and 28th months) at which the contrast pairwise analysis were conducted."
+#| echo: false
+#| results: 'asis'
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+#| out-width: 100%
+
+# plot the estimated rate across age at index admission by years
+fig_emmeans_next_day <- ggplot(readmissions_by_age_next_day_df, aes(x = age_index_admission_yr, 
+                                            y = response * 100)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = asymp.LCL * 100, ymax = asymp.UCL * 100), alpha = 0.2) +
+  geom_point(data = subset(readmissions_by_age_next_day_df, age_index_admission_yr %in%
+                             c(0.5, 1, 1.5, 2)), 
+             aes(x = age_index_admission_yr, y = response * 100),
+             color = "red", size = 1.5) +
+  labs(
+    x = "Patient age (years)",
+    y = "Number of 30-day UHRs per 100 index admissions"
+  ) +
+  scale_x_continuous(breaks = seq(0, 18, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 200, by = 25)) +
+  coord_cartesian(ylim = c(0, max(readmissions_by_age_same_day_df$asymp.UCL*100, na.rm = TRUE))) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 9, face = "bold"),
+    axis.text.y = element_text(size = 9, face = "bold", margin = margin(r = -10)),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    legend.title = element_text(size = 11),
+    legend.position = "bottom",
+    legend.text = element_text(size = 11)
+  )
+
+fig_emmeans_next_day
+```
+
+###### Contrast for time-points of interest
+
+```{r}
+#| label: tbl-contrast-time-points-model-nb-int-next-day
+#| tbl-cap: "Pairwise contrast for time-points of interest (6, 12, 18, and 24 months)"
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+# obtain time point of interest to compare from the total emmeans grid
+emm_subset_nb_model_next_day <- subset(readmissions_by_age_next_day, 
+                                   age_index_admission_yr %in% c(0.5, 1, 1.5, 2))
+
+# time point comparison
+contrast_nb_model_int_next_day <- emmeans::contrast(emm_subset_nb_model_next_day,
+                                            method = "pairwise", 
+                                            ref = 1, # reference is 0.5 years
+                                            adjust = "tukey"
+                                            ) 
+
+tbl_contrast_nb_model_int_next_day <- contrast_nb_model_int_next_day %>%
+  as.data.frame() %>%
+  dplyr::select(-c("df", "null", "z.ratio")) %>%
+  transmute(
+    `Contrasted time-points (years)` =
+      str_squish(str_replace_all(contrast, c("age_index_admission_yr" = "", "/" = " vs "))),
+    Ratio = ratio,
+    SE = SE,
+    `P value` = case_when(
+      p.value < 1e-4 ~ "< 0.0001",
+      p.value < 0.05 ~ "< 0.05",
+      TRUE ~ sprintf("%.3f", p.value)
+    )
+  ) %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::colformat_double(j = c("Ratio", "SE"), digits = 2) %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(
+    values = c(
+      "Note 1: Tukey-adjusted wald tests performed on the log scale, based on the asymptotic distribution of the estimates.",
+      "Note 2: P-values < 0.05 indicate that the predicted number of 30-day UHRs at the contrasted time points were significantly different."
+    )
+  ) %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9)  
+
+tbl_contrast_nb_model_int_next_day
+```
+
+::: {.content-visible when-format="html"}
+
+# Appendix {#appendix}
+
+## Data layout
+
+In this example for few patients, each row corresponds to one index admission. The variable `count_readmissions` corresponds to the number of 30-day UHRs occurring after each index admission. The variable `exptime` corresponds to the exposure time in days for each index admission, which is used as an offset in the NB model. The variable `patient_seq_id` is a numeric identifier for each patient, which is used as a random effect in the NB model to account for multiple index admissions per patient. The age at index admission is represented by the variable `age_index_admission_yr` in years, is used as main timescale in the models and the rest of variables are the covariates included in the models. Some of them are fixed over time (e.g., `sex`) while others are time-varying covariates (e.g., `seizure_related_index_admission`).
+
+```{r}
+#| label: tbl-readmissions-layout-main-df
+#| tbl-cap: "Data layout for 30-day UHR endpoint for 5 patients ('patient_seq_id') with three covariates. Each observation corresponds to one index admission"
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+# Show data layout without patient id that will be used in the full model
+readmissions_df_layout <- readmissions_df %>%
+  # replace original patient_uuid ids to display data
+  mutate(patient_seq_id = as.numeric(factor(patient_uuid))) %>%
+  arrange(patient_seq_id, age_index_admission_yr) %>%
+  dplyr::select(
+    patient_seq_id, 
+    sex,
+    age_index_admission_yr,
+    seizure_related_index_admission
+  ) %>%
+  head(18) %>%                     # take first 18 rows
+  flextable() %>%                  # NOW create the flextable
+  autofit() %>%
+  set_table_properties(width = 1, layout = "autofit") %>%  # fit page width in Word
+  font(part = "all", fontname = "Century Gothic") %>%
+  fontsize(part = "all", size = 11) %>%
+  add_footer_lines(values = "Note: Only the first 18 rows are shown for illustrative purposes.") %>%
+  fontsize(part = "footer", size = 9) %>%
+  italic(part = "footer", italic = TRUE) %>%
+  align(part = "footer", align = "left")
+
+readmissions_df_layout
+```
+
+## Summary of main and sensitivity analyses
+
+```{r}
+#| label: tbl-sensit-summary
+#| tbl-cap: "Summary of the number of records (i.e., index admissions), 30-day UHR events and patients with at least one index admission for the main and sensitivity analyses"
+#| echo: false
+#| results: 'markup'
+
+# Build the table data directly
+summary_dataframes <- bind_rows(
+  nb_model_main_df %>%
+    summarise(
+      Analysis = "Main",
+      `Index admissions` = n(),
+      `30-day UHRs` = sum(replace_na(count_readmissions, 0)),
+      Patients = n_distinct(patient_uuid)
+    ),
+  
+  readmissions_merged_same_day_df %>%
+    summarise(
+      Analysis = "Sensitivity (I)",
+      `Index admissions` = n(),
+      `30-day UHRs` = sum(replace_na(count_readmissions, 0)),
+      Patients = n_distinct(patient_uuid)
+    ),
+  
+  readmissions_merged_next_day_df %>%
+    summarise(
+      Analysis = "Sensitivity (II)",
+      `Index admissions` = n(),
+      `30-day UHRs` = sum(replace_na(count_readmissions, 0)),
+      Patients = n_distinct(patient_uuid)
+    )
+)
+
+summary_dataframes %>%
+flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::bold(part = "header", bold = TRUE)
+```
+
+## Record distribution for selected covariates
+
+### Main analyses
+
+```{r}
+#| label: tbl-records-distribution-index-admissions
+#| tbl-cap: "Distribution of variables of interest for index admissions in main analyses"
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+# Create summary table with correct type for multi-stat display
+readmissions_df %>%
+  dplyr::select(
+    count_readmissions,
+    sex,
+    age_index_admission_yr,
+    neonatal_onset,
+    other_epilepsy_mutations,
+    recurrent_variant,
+    seizure_related_index_admission,
+    length_of_index_stay_days_cat,
+    respiratory_support_index_admission,
+    tech_assistance_ever,
+    vns_insertion_ever,
+    n_distinct_asm_index_admission,
+    adverse_effect_index_admission,
+    ketogenic_diet_admission,
+    quinidine_admission
+  ) %>%
+  tbl_summary(
+    type = list(
+      age_index_admission_yr = "continuous2",
+      n_distinct_asm_index_admission = "continuous2"
+    ),
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})", "{median} ({min}–{max})"),
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1
+  ) %>%
+  modify_header(label ~ "**Variable**") %>%
+  modify_caption("**Summary of Index admissions**") %>%
+  bold_labels() %>%
+  italicize_levels() %>%
+  as_flex_table() %>%
+  flextable::font(fontname = "Century Gothic", part = "all") %>%
+  flextable::fontsize(size = 11, part = "all") %>%
+  flextable::autofit()
+```
+
+### Sensitivity analyses (I)
+
+```{r}
+#| label: tbl-records-distribution-index-admissions-sensitivity-same-day
+#| tbl-cap: "Distribution of variables of interest for index admissions for sensitivity analysis I"
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+# Create summary table with correct type for multi-stat display
+readmissions_merged_same_day_df %>%
+  dplyr::select(
+    count_readmissions,
+    sex,
+    age_index_admission_yr,
+    neonatal_onset,
+    other_epilepsy_mutations,
+    recurrent_variant,
+    seizure_related_index_admission,
+    length_of_index_stay_days_cat,
+    respiratory_support_index_admission,
+    tech_assistance_ever,
+    vns_insertion_ever,
+    n_distinct_asm_index_admission,
+    adverse_effect_index_admission,
+    ketogenic_diet_admission,
+    quinidine_admission
+  ) %>%
+  tbl_summary(
+    type = list(
+      age_index_admission_yr = "continuous2",
+      n_distinct_asm_index_admission = "continuous2"
+    ),
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})", "{median} ({min}–{max})"),
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1
+  ) %>%
+  modify_header(label ~ "**Variable**") %>%
+  modify_caption("**Summary of Index admissions**") %>%   
+  bold_labels() %>%
+  italicize_levels() %>%
+  as_flex_table() %>%
+  flextable::font(fontname = "Century Gothic", part = "all") %>%
+  flextable::fontsize(size = 11, part = "all") %>%
+  flextable::autofit()
+```
+
+### Sensitivity analyses (II)
+
+```{r}
+#| label: tbl-records-distribution-index-admissions-sensitivity-next-day
+#| tbl-cap: "Distribution of variables of interest for index admissions for sensitivity analysis II"
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+# Create summary table with correct type for multi-stat display
+readmissions_merged_next_day_df %>%
+  dplyr::select(
+    count_readmissions,
+    sex,
+    age_index_admission_yr,
+    neonatal_onset,
+    other_epilepsy_mutations,
+    recurrent_variant,
+    seizure_related_index_admission,
+    length_of_index_stay_days_cat,
+    respiratory_support_index_admission,
+    tech_assistance_ever,
+    vns_insertion_ever,
+    n_distinct_asm_index_admission,
+    adverse_effect_index_admission,
+    ketogenic_diet_admission,
+    quinidine_admission
+  ) %>%
+  tbl_summary(
+    type = list(
+      age_index_admission_yr = "continuous2",
+      n_distinct_asm_index_admission = "continuous2"
+    ),
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})", "{median} ({min}–{max})"),
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1
+  ) %>%
+  modify_header(label ~ "**Variable**") %>%
+  modify_caption("**Summary of Index admissions**") %>%
+  bold_labels() %>%
+  italicize_levels() %>%
+  as_flex_table() %>%
+  flextable::font(fontname = "Century Gothic", part = "all") %>%
+  flextable::fontsize(size = 11, part = "all") %>%
+  flextable::autofit()
+```
+
+## Verification of pre-post modelling assumptions
+
+**Pre-modelling assumptions** for negative binomial models were evaluated following the list proposed by @hilbeNegativeBinomialRegression2011 for main and sensitivity analysis:
+
+1.  *Zero counts are possible in the outcome* Index admissions can have 0 count of 30-day UHRs.
+
+2.  *Excess zeros in the outcome (more than than NB model accounts for)*. This violation was checked due to the high proportion of zeros (\~60% of index admission have no subsequent 30-day UHR event.
+
+Although it has been argued that NB models can adequately handle excess zeros [@fernandezComparisonStatisticalMethods2022], it was formally assessed this assumption by comparing observed and predicted zeros using `performance` package. For each analysis, the ratio of observed to predicted zeros was within the predefined tolerance range.
+
+There was no indication of zero-inflation, and a ZINB model was not required as the proposed negative binomial model adequately captured the excess zero.
+
+3.  *When zeros and positives values are assumed to be separated by an obstacle (hurdle or threshold), a hurdle model may be better.* This assumption does not apply here, the count of UHRs (0,1,2,3…) comes from the same underlying process (readmissions per index admission).
+
+4.  *Censoring.* Accounted by using the actual observed follow-up time ≤30 days as offset term. Moreover, records with no at-risk time or in-hospital death were excluded, as they cannot experience the outcome.
+
+5.  *Truncation (counts below or above threshold are excluded).* Zeros are included, and all counts ≥0 are recorded.
+
+6.  *Within-subject correlation*. It was accounted with the use of both random intercept and random slope.
+
+7.  *Selection mechanism (when counts only occur if another variable passes a threshold*. There is no indication our data has a selection mechanism.
+
+8.  *Endogeneity (omitted variables / mismeasurement / categorization bias affecting predictors)*. It was accounted accounted by through careful covariate selection and planned sensitivity analyses to assess robustness of results for 30-day UHRs
+
+Lastly, for **post-modelling assumptions**, overdispersion, collinearity (in body document), normality of random effects (QQ plot and normality test) and the linearity of the effect of age at index admission (main timescale) were checked:
+
+1.  *Overdispersion*. No overdispersion was detected in any of the minimal models.
+
+2.  *Collinearity*. It was low (VIF \< 3) in all maximal feasibles and final models. It is important to mention that VIF values for variables algebraically connected to each other such as the restricted cubic splines should not be interpreted [@harrellRegressionModelingStrategies2015].
+
+3.  *Normality of random effects*. Normality tests indicated some deviation from normality of random slopes and random intercept in sensitivity analysis. However, QQ plots showed that random effects followed the expected normal quantiles closely, with only mild tail deviations.
+
+4.  *Linearity of the log-link function for age at index admission*. It was evaluated through residuals vs. fitted plots and by comparing the fit of models with age entered as a linear term versus restricted cubic splines. Models with splines consistently showed improved fit as described for each of the analysis.
+
+### Main analyses
+
+```{r}
+#| label: tbl-zero-inflated-model-assumption-excess-zeros-main-df
+#| tbl-cap: "Zero inflated assumption check for main analyses"
+#| echo: false
+#| results: 'markup'
+
+# check for excess zeros in the outcome
+# strict tolerance (±5% around 1)
+check_zeroinflation(nb_model_min, tolerance = 0.05)
+```
+
+```{r}
+#| label: tbl-overdispersion-assumption-nb-model-main-df
+#| tbl-cap: "Overdispersion check for negative binomial model with linear effects for main analysis"
+#| echo: false
+#| message: false
+#| results: 'markup'
+
+#' Overdispersion (variance is larger than mean).
+#' Important to mention that the NB model can still be used, as it often 
+#' provides more robust estimates than Poisson model even when overdispersion
+#'  is not formally detected
+#' No overdispersion detected
+check_overdispersion(nb_model_min)
+```
+
+```{r}
+#| label: tbl-model-diagnostic-main-df
+#| tbl-cap: "Model diagnostic for minimal main model"
+#| echo: false
+#| results: 'markup'
+
+# check normality of random effects, homoscedasticity and uniformity of residuals
+check_model(nb_model_min)
+```
+
+```{r}
+#| label: fig-linearity-assumption-nb-model-main-df
+#| fig-cap: "Linearity of the log-link assumption (residuals vs age with LOESS smoother)"
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+#| out-width: 100%
+
+# Residuals vs age: if the linearity (on log scale)
+#' The LOESS deviates from zero across the age range, indicating that the 
+#' linear effect of age on the log scale may be misspecified
+res_df <- data.frame(
+  age   = nb_model_main_df$age_index_admission_yr,
+  resid = resid(nb_model_min, type = "pearson")
+)
+
+plot(res_df$age, res_df$resid, pch = 16, col = "blue",
+     xlab = "Age at index admission (years)", ylab = "Pearson residuals")
+abline(h = 0, lty = 2)
+lines(lowess(res_df$age, res_df$resid, f = 0.8))
+```
+
+```{r}
+#| label: tbl-overdispersion-assumption-nb-model-main-rcs-df
+#| tbl-cap: "Overdispersion check for negative binomial model with non-linear effects for main analysis"
+#| echo: false
+#| message: false
+#| results: 'markup'
+
+#' Overdispersion (variance is larger than mean).
+#' Important to mention that the NB model can still be used, as it often 
+#' provides more robust estimates than Poisson model even when overdispersion
+#'  is not formally detected
+#' No overdispersion detected
+check_overdispersion(nb_model_rcs_min)
+```
+
+```{r}
+#| label: tbl-model-diagnostic-main-df-rcs
+#| tbl-cap: "Model diagnostic for minimal main model with non-linear effects"
+#| echo: false
+#| results: 'markup'
+#v check normality of random effects, homoscedasticity and uniformity of residuals
+check_model(nb_model_rcs_min)
+```
+
+```{r}
+#| label: tbl-nb-rcs-models-multicollinearity-test-final-model
+#| tbl-cap: "Model diagnostic for the final stepwise model with non-linear effects and interaction terms."
+#| echo: false
+#| results: 'markup'
+# model diagnostic by diagnostic type to get a bigger plot
+check_model(nb_model_rcs_stepwise_interactions, panel = FALSE) %>%
+  plot()
+```
+
+### Sensitivity analyses (I)
+
+```{r}
+#| label: tbl-zero-inflated-model-assumption-excess-zeros-sensitivity-same-day-df
+#| tbl-cap: "Zero inflated assumption check for sensitivity analyses (I)"
+#| echo: false
+#| results: 'markup'
+check_zeroinflation(nb_model_min_sensit_same_day, tolerance = 0.05)
+```
+
+```{r}
+#| label: tbl-overdispersion-assumption-nb-model-same-day-df
+#| tbl-cap: "Overdispersion check for negative binomial model for sensitivity analysis (I)"
+#| echo: false
+#| message: false
+#| results: 'markup'
+#' No overdispersion detected 
+check_overdispersion(nb_model_min_sensit_same_day)
+```
+
+```{r}
+#| label: tbl-model-diagnostic-same-day-df
+#| tbl-cap: "Model diagnostic for minimal model"
+#| echo: false
+#| results: 'markup'
+# check normality of random effects, homoscedasticity and uniformity of residuals
+check_model(nb_model_min_sensit_same_day)
+```
+
+```{r}
+#| label: fig-linearity-assumption-nb-model-same-day-df
+#| fig-cap: "Linearity of the log link function assumption for main analysis"
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+#| out-width: 100%
+
+# Residuals vs age: if the linearity (on log scale)
+#' The LOESS deviates from zero across the age range, indicating that the 
+#' linear effect of age on the log scale may be misspecified
+res_df_same_day <- data.frame(
+  age   = nb_model_sensit_df_same_day$age_index_admission_yr,
+  resid = resid(nb_model_min_sensit_same_day, type = "pearson")
+)
+
+plot(res_df_same_day$age, res_df_same_day$resid, pch = 16, col = "blue",
+     xlab = "Age at index admission (years)", ylab = "Pearson residuals")
+abline(h = 0, lty = 2)
+lines(lowess(res_df_same_day$age, res_df_same_day$resid, f = 0.8))
+```
+
+```{r}
+#| label: tbl-overdispersion-assumption-nb-model-same-day-rcs-df
+#| tbl-cap: "Overdispersion check for negative binomial model for sensitivity analysis (I)"
+#| echo: false
+#| message: false
+#| results: 'markup'
+
+#' No overdispersion detected 
+check_overdispersion(nb_model_rcs_min_sensit_same_day)
+```
+
+```{r}
+#| label: tbl-model-diagnostic-same-day-df-rcs
+#| tbl-cap: "Model diagnostic for minimal model with non-linear effects"
+#| echo: false
+#| results: 'markup'
+
+#v check normality of random effects, homoscedasticity and uniformity of residuals
+check_model(nb_model_rcs_min_sensit_same_day)
+```
+
+```{r}
+#| label: tbl-nb-rcs-models-multicollinearity-test-final-model-same-day
+#| tbl-cap: "Model diagnostic for the final stepwise model with non-linear effects and interaction terms."
+#| echo: false
+#| results: 'markup'
+
+# model diagnostic by diagnostic type to get a bigger plot
+check_model(nb_model_rcs_stepwise_sensit_same_day_interactions, panel = FALSE) %>%
+  plot()
+```
+
+### Sensitivity analyses (II)
+
+```{r}
+#| label: tbl-zero-inflated-model-assumption-excess-zeros-sensitivity-next-day-df
+#| tbl-cap: "Zero inflated assumption check for sensitivity analysis (II)"
+#| echo: false
+#| results: 'markup'
+
+check_zeroinflation(nb_model_min_sensit_next_day, tolerance = 0.05)
+```
+
+```{r}
+#| label: tbl-overdispersion-assumption-nb-model-next-day-df
+#| tbl-cap: "Revision of post-modelling assumptions for negative binomial models: sensitivity analyses (II)"
+#| echo: false
+#| message: false
+#| results: 'markup'
+
+#' No overdispersion detected
+check_overdispersion(nb_model_min_sensit_next_day)
+```
+
+```{r}
+#| label: tbl-model-linear-diagnostic-next-day-df
+#| tbl-cap: "Model diagnostic for minimal model"
+#| echo: false
+#| results: 'markup'
+# check normality of random effects, homoscedasticity and uniformity of residuals
+check_model(nb_model_min_sensit_next_day)
+```
+
+```{r}
+#| label: fig-linearity-assumption-nb-model-next-day-df
+#| fig-cap: "Linearity of the log link function assumption for sensitivity analysis (II)"
+#| echo: false
+#| message: false
+#| results: 'markup'
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+#| out-width: 100%
+
+# Residuals vs age: if the linearity (on log scale)
+#' The LOESS deviates from zero across the age range, indicating that the 
+#' linear effect of age on the log scale may be misspecified
+res_df_next_day <- data.frame(
+  age   = nb_model_sensit_df_next_day$age_index_admission_yr,
+  resid = resid(nb_model_min_sensit_next_day, type = "pearson")
+)
+
+plot(res_df_next_day$age, res_df_next_day$resid, pch = 16, col = "blue",
+     xlab = "Age at index admission (years)", ylab = "Pearson residuals")
+abline(h = 0, lty = 2)
+lines(lowess(res_df_next_day$age, res_df_next_day$resid, f = 0.8))
+```
+
+```{r}
+#| label: tbl-overdispersion-assumption-nb-model-next-day-rcs-df
+#| tbl-cap: "Revision of post-modelling assumptions for negative binomial models: sensitivity analyses (II)"
+#| echo: false
+#| message: false
+#| results: 'markup'
+#' No overdispersion detected
+check_overdispersion(nb_model_rcs_min_sensit_next_day)
+```
+
+```{r}
+#| label: tbl-model-diagnostic-next-day-df
+#| tbl-cap: "Model diagnostic for minimal model with non-linear effects"
+#| echo: false
+#| results: 'markup'
+
+#v check normality of random effects, homoscedasticity and uniformity of residuals
+check_model(nb_model_rcs_min_sensit_next_day)
+```
+
+```{r}
+#| label: tbl-nb-rcs-models-multicollinearity-test-final-model-sensit-next-day
+#| tbl-cap: "Model diagnostic for the final stepwise model with non-linear effects"
+#| echo: false
+#| results: 'markup'
+
+# model diagnostic by diagnostic type to get a bigger plot
+check_model(nb_model_rcs_stepwise_sensit_next_day, panel = FALSE) %>%
+  plot()
+```
+
+## Optimal number of knots for RCS with all covariates
+
+### Main analyses
+
+```{r}
+#| label: tbl-nb-rcs-full-test-optimal-knots-main-analyses
+#| tbl-cap: "Optimal number of knots for the RCS full model"
+#| echo: false
+#| results: 'markup'
+#| warning: false
+
+# list of covariates
+COVARIATES <- c(
+  "neonatal_onset", 
+  "other_epilepsy_mutations", 
+  "recurrent_variant", 
+  "seizure_related_index_admission",  
+  "length_of_index_stay_days_cat",
+  "respiratory_support_index_admission", 
+  "tech_assistance_ever", 
+  "vns_insertion_ever", 
+  "n_distinct_asm_index_admission",
+  "adverse_effect_index_admission",
+  "ketogenic_diet_admission",
+  "quinidine_admission"
+)
+
+optimal_knots_full <- suppressMessages(
+  test_knots_ns_glmmTMB(
+    data = nb_model_main_df,
+    predictor = "age_index_admission_yr",
+    response = "count_readmissions",
+    fixed_effects = COVARIATES, 
+    random_effect = "1 | patient_uuid",
+    offset_var = "exptime",
+    k_vec = c(3,4,5),
+    family = nbinom2(link = "log")
+  )
+)
+
+optimal_knots_full
+```
+
+### Sensitivity analyses (I)
+
+```{r}
+#| label: tbl-nb-rcs-full-test-optimal-knots-sensit-same-day
+#| tbl-cap: "Optimal number of knots for the RCS full model with sensitivity analyses I"
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| warning: false
+
+optimal_knots_same_day_full <- suppressMessages(
+  test_knots_ns_glmmTMB(
+    data = nb_model_sensit_df_same_day,
+    predictor = "age_index_admission_yr",
+    response = "count_readmissions",
+    fixed_effects = COVARIATES, 
+    random_effect = "1 | patient_uuid",
+    offset_var = "exptime",
+    k_vec = c(3,4,5),
+    family = nbinom2(link = "log")
+  )
+)
+
+optimal_knots_same_day_full
+```
+
+### Sensitivity analyses (II)
+
+```{r}
+#| label: tbl-nb-rcs-full-test-optimal-knots-sensit-next-day
+#| tbl-cap: "Optimal number of knots for the RCS full model with sensitivity analyses II"
+#| echo: false
+#| results: 'markup'
+#| message: false
+#| warning: false
+
+optimal_knots_next_day_full <- suppressMessages(
+  test_knots_ns_glmmTMB(
+    data = nb_model_sensit_df_next_day,
+    predictor = "age_index_admission_yr",
+    response = "count_readmissions",
+    fixed_effects = COVARIATES, 
+    random_effect = "1 | patient_uuid",
+    offset_var = "exptime",
+    k_vec = c(3,4,5),
+    family = nbinom2(link = "log")
+  )
+)
+
+optimal_knots_next_day_full
+```
+
+## Model averaging and all combinations
+
+### Main analyses
+
+```{r}
+#| label: all-model-combinations-from-maximal-feasible-model
+#| echo: false
+#| eval: false
+#| warning: false
+#| message: false
+
+# set max feasible/full model with RCS and all covariates
+nb_model_rcs_max_feasible <- glmmTMB(
+  count_readmissions ~
+    ns(age_index_admission_yr,
+      knots = knots_rcs[2:3],
+      Boundary.knots = c(knots_rcs[1], knots_rcs[4])
+    ) + sex + offset(log(exptime)) +
+    neonatal_onset +
+    other_epilepsy_mutations +
+    recurrent_variant +
+    seizure_related_index_admission +
+    length_of_index_stay_days_cat +
+    respiratory_support_index_admission +
+    tech_assistance_ever +
+    vns_insertion_ever +
+    n_distinct_asm_index_admission +
+    adverse_effect_index_admission +
+    ketogenic_diet_admission +
+    quinidine_admission +
+    (1 | patient_uuid),
+  data = nb_model_main_df,
+  family = nbinom2()
+)
+
+#' Dredge exhaustively fits all possible combinations of fixed effects:
+#'  https://cran.r-project.org/web/packages/MuMIn/MuMIn.pdf
+#'  https://uoftcoders.github.io/rcourse/lec09-model-selection.html#step_1:_create_saturated_model
+
+options(na.action = "na.fail") # Required by dredge
+
+model_all_combinations <- dredge(
+  # start from maximal feasible model
+  nb_model_rcs_max_feasible, 
+  trace = 2, # show progress bar 
+  # terms to force (random effects are already accounted)
+  fixed = c(
+    "cond(sex)",
+    "cond(ns(age_index_admission_yr, 
+       knots = knots_rcs[2:3], 
+       Boundary.knots = c(knots_rcs[1], knots_rcs[4])))",
+    "cond(offset(log(exptime)))"),
+  # criteria to rank models
+  rank = "AIC")
+
+options(na.action = "na.omit") # set back to default
+```
+
+```{r}
+#| label: tbl-all-model-combinations-from-maximal-feasible-model-2
+#| tbl-cap: "All model combinations from the maximal feasible model"
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'markup'
+
+# note: the output was saved in r rds file as takes close to 2 hs to run
+# dir.create("~/RWE-rare_disease/Hospitalizations/output/rds_data")
+#saveRDS(model_all_combinations, "rds_data/model_all_combinations_new.rds")
+
+# If already saved, just load it
+model_all_combinations_full <- readRDS("rds_data/model_all_combinations_new.rds")
+
+# view first rows of the model combinations
+head(model_all_combinations_full, 10) 
+
+# # model with the lowest AIC from all possible combinations
+# lowest_aic_model <- get.models(model_all_combinations_full, subset = 1)[[1]]
+
+# # extract formula of the model with the lowest AIC
+# all_combinations_lowest_aic <- formula(lowest_aic_model)
+# all_combinations_lowest_aic
+```
+
+Compared to the stepwise selection, when an exhaustive process of all possible combinations of covariates is conducted, it can be observed that among 8192 possible combinations, the model with the lowest AIC differs with the stepwise in the exclusion of `seizure_related_index_admission` and `n_distinct_asm_index_admission`. Additionally, a slightly lower AIC for the model obtained through all combinations (615.5 vs. 616.1) was observed.
+
+```{r}
+#| label: tbl-all-model-combinations-model-avg
+#| tbl-cap: "Model averaging from all model combinations"
+#| echo: false
+#| message: false
+#| warning: false
+#| results: 'markup'
+
+# 1. get list of models with an AIC value (converged models)
+models_converged_list <- model_all_combinations_full[!is.na(model_all_combinations_full$AIC), ]
+
+# 2. get models with delta AIC ≤ 2 of difference to the lowest AIC model
+#' Note: models with values less than 2 are considered to be essentially
+#'  as good as the best model.
+# https://link.springer.com/article/10.1007/s00265-010-1037-6
+avg_mod <- model.avg(models_converged_list, subset = delta <= 2) # 39 models
+
+# 3. Summary of the model averaging
+#' Note: here it can be observed the combination of variables in the models that
+#'  are separated by less than 2 units to the model with the lowest AIC
+#'  From the full averaging part of the output:
+#'  How much that predictor changes the model’s predicted outcome, on average
+#'   across the top AIC-supported models, after accounting for model selection
+#'    uncertainty.
+summary(avg_mod)
+
+# Sum of model weights over all models including each variable.
+#' https://pmc.ncbi.nlm.nih.gov/articles/PMC7855182/
+#' https://link.springer.com/article/10.1007/s00265-010-1037-6
+#' Note1: If a particular variable appears in all models, then its summed Akaike 
+#' weight will tend towards 1. otherwise its weight will tend  towards 0.
+#' Note2: Some authors may put a 0.9 or 0.95 to define the threshold of 
+#' importance, but it is not a strict rule. 
+#' Indicates how often and with what support each variable appears in the set of models.
+sw(avg_mod) # sum of weights
+```
+
+When obtaining the list of models with a delta AIC ≤ 2 from the model with the lowest AIC (39 models), it can be observed that the covariate `length_of_index_stay_days_cat` and `adverse_effect_index_admission` were present in all models (sum of weights = 1) besides the forced ones (age, sex and offset). Among the other variables, `recurrent_variant` (0.93) and `quinidine_admission` (0.80) showed high importance, being present in 36 and 30 models, respectively.
+
+The covariates `other_epilepsy_mutations` (0.69), `ketogenic_diet_admission` (0.61), `seizure_related_index_admission` (0.47) and `respiratory_support_index_admission` (0.38), had moderate weights, appearing in 16–27 models within the delta AIC ≤ 2 set. Interestingly, `n_distinct_asm_index_admission` (0.24) was retained in the stepwise model, despite having a lower weight than `respiratory_support_index_admission` (0.38), which was excluded in the final step.
+
+Finally, `tech_assistance_ever` (0.22), `vns_insertion_ever` (0.04), and `neonatal_onset` (0.04) had very low weights with presence in 2-10 out of 39 models, confirming their limited contribution to model fit.
+
+*Note: Because `respiratory_support_index_admission` was excluded while `n_distinct_asm_index_admission` was retained in the stepwise model. Despite the opposite pattern observed for those two covariates in the model averaging analysis, the stepwise and maximum feasible model procedures were also re-estimated with alternative optimizer settings, yielding identical results to the default estimation.*
+
+### Sensitivity analyses (I)
+
+```{r}
+#| label: all-model-combinations-from-maximal-feasible-model-sensit-same-day
+#| echo: false
+#| eval: false
+#| warning: false
+#| message: false
+
+
+# set full model with RCS and all covariates
+nb_model_rcs_max_feasible_sensit_same_day <- glmmTMB(
+  count_readmissions ~
+    ns(age_index_admission_yr,
+      knots = knots_rcs[2:3],
+      Boundary.knots = c(knots_rcs[1], knots_rcs[4])
+    ) + sex + offset(log(exptime)) +
+    neonatal_onset +
+    other_epilepsy_mutations +
+    recurrent_variant +
+    seizure_related_index_admission +
+    length_of_index_stay_days_cat +
+    respiratory_support_index_admission +
+    tech_assistance_ever +
+    vns_insertion_ever +
+    n_distinct_asm_index_admission +
+    adverse_effect_index_admission +
+    ketogenic_diet_admission +
+    quinidine_admission +
+    (1 | patient_uuid),
+  data = nb_model_sensit_df_same_day,
+  family = nbinom2(), 
+  control = glmmTMBControl(
+      optimizer = optim,
+      optArgs = list(method = "BFGS")
+    ))
+
+options(na.action = "na.fail") # Required by dredge
+
+#' Dredge package was used and explained in detail in the main analyses
+model_all_combinations_same_day <- dredge(
+  # start from maximal feasible model
+  nb_model_rcs_max_feasible_sensit_same_day,
+  trace = 2, 
+  # terms to force as done in main analyses
+  fixed = c(
+    "cond(sex)",
+    "cond(ns(age_index_admission_yr,
+    knots = knots_rcs_same_day[2:3], 
+    Boundary.knots = c(knots_rcs_same_day[1], knots_rcs_same_day[4])))",
+    "cond(offset(log(exptime)))"),
+  rank = "AIC")
+
+options(na.action = "na.omit") # set back to default
+```
+
+```{r}
+#| label: tbl-all-model-combinations-from-maximal-feasible-model-sensit-same-day-2
+#| tbl-cap: "All model combinations from the maximal feasible model - Sensitivity analysis same day"
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'markup'
+
+# note: the output was saved in r rds file as takes too long to run (close to 1 hour)
+# dir.create("~/RWE-rare_disease/Hospitalizations/output/rds_data")
+# saveRDS(model_all_combinations_same_day, "rds_data/model_all_combinations_same_day_new.rds")
+
+model_all_combinations_same_day_full <- readRDS("rds_data/model_all_combinations_same_day_new.rds")
+
+# view first rows of the model combinations 
+head(model_all_combinations_same_day_full, 10) 
+
+# model with the lowest AIC from all possible combinations
+# lowest_aic_model_same_day <- get.models(model_all_combinations_same_day_full, subset = 1)[[1]]
+
+# all_combinations_lowest_aic_same_day <- formula(lowest_aic_model_same_day)
+# all_combinations_lowest_aic_same_day
+```
+
+It can be observed that the model with the lowest AIC (591.7) was the same model than the obtained from the stepwise selection procedures.
+
+```{r}
+#| label: tbl-all-model-combinations-model-avg-sensitivity-same-day
+#| tbl-cap: "Model averaging from all model combinations - Sensitivity analysis same day"
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'markup'
+
+# Repeating the steps performed in the main analyses
+# 1. get list of models with an AIC value (converged models)
+models_converged_list_same_day <- model_all_combinations_same_day_full[!is.na(model_all_combinations_same_day_full$AIC), ]
+
+# 2. get models with delta AIC ≤ 2 of difference to the lowest AIC model
+avg_mod_same_day <- model.avg(models_converged_list_same_day, subset = delta <= 2) # 59 models
+
+# 3. Summary of the model averaging
+summary(avg_mod_same_day)
+
+# Sum of model weights over all models including each explanatory variable.
+sw(avg_mod_same_day) 
+```
+
+When obtaining the list of models with a delta AIC ≤ 2 (59 models), it can be observed that the covariate `length_of_index_stay_days_cat` was present in all models (sum of weights = 1) besides the forced ones (age, sex and offset). Among the other variables, `other_epilepsy_mutations` (0.94) and `recurrent_variant` (0.89) showed high importance, being present in 55 and 52 models, respectively.
+
+The covariates `adverse_effect_index_admission` (0.80), `seizure_related_index_admission` (0.66), `respiratory_support_index_admission` (0.58), and `quinidine_admission` (0.53) had moderate weights, appearing in 30–46 models within the delta AIC ≤ 2 set.
+
+In contrast, `n_distinct_asm_index_admission` (0.36) and `ketogenic_diet_admission` (0.29) had relatively low importance despite being retained in the stepwise model, consistent with the findings from the main analysis. Finally, `tech_assistance_ever` (0.16), `vns_insertion_ever` (0.07), and `neonatal_onset` (0.05) had very low weights, confirming their limited contribution to model fit.
+
+### Sensitivity analyses (II)
+
+```{r}
+#| label: all-model-combinations-from-maximal-feasible-model-sensit-next-day
+#| echo: false
+#| eval: false
+#| warning: false
+#| message: false
+
+# set full model with RCS and all covariates
+nb_model_rcs_max_feasible_sensit_next_day <- glmmTMB(
+  count_readmissions ~
+    ns(age_index_admission_yr,
+      knots = knots_rcs[2:3],
+      Boundary.knots = c(knots_rcs[1], knots_rcs[4])
+    ) + sex + offset(log(exptime)) +
+    neonatal_onset +
+    other_epilepsy_mutations +
+    recurrent_variant +
+    seizure_related_index_admission +
+    length_of_index_stay_days_cat +
+    respiratory_support_index_admission +
+    tech_assistance_ever +
+    vns_insertion_ever +
+    n_distinct_asm_index_admission +
+    adverse_effect_index_admission +
+    ketogenic_diet_admission +
+    quinidine_admission +
+    (1 | patient_uuid),
+  data = nb_model_sensit_df_next_day,
+  family = nbinom2(), 
+  control = glmmTMBControl(
+      optimizer = optim,
+      optArgs = list(method = "BFGS")
+    ))
+
+options(na.action = "na.fail") # Required by dredge
+
+#' Dredge package was used and explained in detail in the main analyses
+model_all_combinations_next_day <- dredge(
+  # start from maximal feasible model
+  nb_model_rcs_max_feasible_sensit_next_day,
+  trace = 2, 
+  # terms to force as done in main analyses
+  fixed = c(
+    "cond(sex)",
+    "cond(ns(age_index_admission_yr, 
+    knots = knots_rcs_next_day[2], 
+    Boundary.knots = c(knots_rcs_next_day[1], knots_rcs_next_day[3])))",
+    "cond(offset(log(exptime)))"),
+  rank = "AIC")
+
+options(na.action = "na.omit") # set back to default
+```
+
+```{r}
+#| label: tbl-all-model-combinations-from-maximal-feasible-model-sensit-next-day-2
+#| tbl-cap: "All model combinations from the maximal feasible model - Sensitivity analysis next day"
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'markup'
+
+# note: the output was saved in r rds file as takes too long to run (close to 1 hour)
+# dir.create("~/RWE-rare_disease/Hospitalizations/output/rds_data")
+# saveRDS(model_all_combinations_next_day, "rds_data/model_all_combinations_next_day_new.rds")
+
+# If already saved, just load it
+model_all_combinations_next_day_full <- readRDS("rds_data/model_all_combinations_next_day_new.rds")
+
+# view first rows of the model combinations 
+head(model_all_combinations_next_day_full, 10) 
+
+# model with the lowest AIC from all possible combinations
+#lowest_aic_model_next_day <- get.models(model_all_combinations_next_day_full, subset = 1)[[1]]
+
+# extract formula
+#all_combinations_lowest_aic_next_day <- formula(lowest_aic_model_next_day)
+#all_combinations_lowest_aic_next_day
+```
+
+It can be observed that the model with the lowest AIC (560.4) was the same model than the obtained from the stepwise selection procedures.
+
+```{r}
+#| label: tbl-all-model-combinations-model-avg-sensitivity-next-day
+#| tbl-cap: "Model averaging from all model combinations - Sensitivity analysis next day"
+#| echo: false
+#| message: false
+#| results: 'markup'
+#| warning: false
+
+# Repeating the steps performed in the main analyses
+# 1. get list of models with an AIC value (converged models)
+models_converged_list_next_day <- model_all_combinations_next_day_full[!is.na(model_all_combinations_next_day_full$AIC), ]
+
+# 2. get models with delta AIC ≤ 2 of difference to the lowest AIC model
+avg_mod_next_day <- model.avg(models_converged_list_next_day, subset = delta <= 2) # 39 models 
+
+# 3. Summary of the model averaging
+summary(avg_mod_next_day)
+
+# Sum of model weights over all models including each explanatory variable.
+sw(avg_mod_next_day) 
+```
+
+When obtaining the list of models with a delta AIC ≤ 2 (39 models), it can be observed that the only covariate which was present in all models (besides age, sex and offset which are forced) was `length_of_index_stay_days_cat` (sum of weights = 1). The covariates `other_epilepsy_mutations` and `recurrent_variant` also showed high importance, with sum of weights of 0.93 and 0.83, respectively.
+
+The covariates `respiratory_support_index_admission` (0.81), `seizure_related_index_admission` (0.54), `adverse_effect_index_admission` (0.40) and `n_distinct_asm_index_admission` (0.36) had moderate weights, being present in 13–31 of the models within delta AIC ≤ 2. Important to mention that in this case and in the stepwise models, the `adverse_effect_index_admission` covariate was not retained, in comparison with the main analysis where it had a higher weight.
+
+In contrast, `neonatal_onset` (0.22), `vns_insertion_ever` (0.22), and `ketogenic_diet_admission` (0.19) had relatively low weights, appearing in less than one-third of the models. Finally, `quinidine_admission` (0.14) and `tech_assistance_ever` (0.02) had the lowest support, included in only 6 and 1 of the models, respectively, confirming their limited contribution to model fit.
+
+## Convergence diagnostics for final models
+
+### Main analyses
+
+```{r}
+#| label: tbl-nb-rcs-models-convergence-final-model
+#| tbl-cap: "Convergence diagnostics for the final negative binomial model with restricted cubic splines and interaction terms"
+#| echo: false
+#| results: 'markup'
+#| warning: false
+#| message: false
+
+#' Indicates up to which value the convergence result is accepted.
+#' Function to check model convergence based on gradient tolerance by using
+#'  performance functions or check_convergence and check_singularity
+#'   (in functions.R)
+model_convergence_singularity(nb_model_rcs_stepwise_interactions)
+```
+
+### Sensitivity analyses (I)
+
+```{r}
+#| label: tbl-nb-rcs-models-convergence-final-model-same-day
+#| tbl-cap: "Convergence diagnostics for the final negative binomial model with restricted cubic splines and interaction terms"
+#| echo: false
+#| results: 'markup'
+#| warning: false
+#| message: false
+
+model_convergence_singularity(nb_model_rcs_stepwise_sensit_same_day_interactions)
+```
+
+### Sensitivity analyses (II)
+
+```{r}
+#| label: tbl-nb-rcs-models-convergence-final-model-next-day
+#| tbl-cap: "Convergence diagnostics for the final negative binomial model with restricted cubic splines and interaction terms"
+#| echo: false
+#| results: 'markup'
+#| warning: false
+#| message: false
+
+model_convergence_singularity(nb_model_rcs_stepwise_sensit_next_day)
+```
+
+```{r}
+#| label: download-figures
+#| echo: false
+#| eval: false
+
+# collect all objects with "fig" in their name and that are ggplot objects
+figs_uhr_endpoint <- mget(ls(pattern = "fig", envir = .GlobalEnv), envir = .GlobalEnv)
+figs_uhr_endpoint <- figs_uhr_endpoint[sapply(figs_uhr_endpoint, inherits, "ggplot")]
+
+# download all figures as png files
+invisible(lapply(names(figs_uhr_endpoint), function(nm) {
+  ggsave(
+    filename = file.path("~/RWE-rare_disease/Hospitalizations/output/plots", paste0(nm, ".png")),
+    plot = figs_uhr_endpoint[[nm]],   # <- fixed name
+    device = "png",
+    width = 10, height = 6, units = "in", dpi = 600
+  )
+  NULL
+}))
+```
+
+:::
+
+# Complementary analyses
+
+## Distribution of index admissions by count of 30-day UHR events.
+```{r}
+#| label: tbl-descriptive-index-number-by-count-30-day-uhr-events
+#| tbl-cap: "Distribution of index admissions by count of 30-day UHR events"
+#| echo: false
+#| results: 'markup'
+
+# patient-level summary count of max uhr
+ patient_unique_counts <- readmissions_df %>%
+   group_by(patient_uuid) %>%
+   summarise(
+     count_readmissions = max(count_readmissions),
+     .groups = "drop"
+   )
+ patient_summary <- patient_unique_counts %>%
+   group_by(count_readmissions) %>%
+   summarise(
+     n_patients = n(),
+     prop_patients = n() / n_distinct(readmissions_df$patient_uuid) * 100,
+     .groups = "drop"
+   )
+ # admission-level summary
+ admission_summary <- readmissions_df %>%
+   group_by(count_readmissions) %>%
+   summarise(
+     n_admissions = n(),
+     prop_admissions = n() / nrow(readmissions_df) * 100,
+     .groups = "drop"
+   )
+ # join both tables
+ combined_summary <- full_join(patient_summary,
+   admission_summary,
+   by = "count_readmissions"
+ ) %>%
+   arrange(count_readmissions)
+ 
+ # Rename the count_readmissions column for clarity
+summary_per_index <- combined_summary %>%
+  mutate(
+    count_and_prop = sprintf("%d (%.1f%%)", n_admissions, round(prop_admissions, 1))
+  ) %>%
+  dplyr::select(
+    `Count of UHR per index admission` = count_readmissions,
+    `Number of index admissions` = count_and_prop
+  )
+
+
+summary_per_index %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%  
+  flextable::add_footer_lines(
+    values = c(
+      "Note: Percentage relative to total number of index admissions (N = 365)."
+    )
+  )  %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9) 
+```
+
+## Number of 30-day UHR per index admission over follow-up
+```{r}
+#| label: tbl-descriptive-number-of-30-day-uhr-events-per-index-admission
+#| tbl-cap: "Number of 30-day UHR per index admission over follow-up"
+#| echo: false
+#| results: 'markup'
+
+
+# total 30-day UHRs for each patient over follow up
+uhr_by_patient <- readmissions_df %>%
+  group_by(patient_uuid) %>%
+  summarise(
+    # sum of 30-day UHRs per patient during follow-up
+    patient_readmissions = mean(count_readmissions, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# summary across patients
+uhr_by_across_patient <- uhr_by_patient %>%
+  summarise(
+    # mean (average) number of UHRs per patient
+    mean_uhr = mean(patient_readmissions, na.rm = TRUE),
+    # standard deviation of UHRs per patient
+    sd_uhr = sd(patient_readmissions),
+    # median (50th percentile) number of UHRs per patient
+    median_uhr = median(patient_readmissions),
+    # minimum number of UHRs observed
+    min_uhr = min(patient_readmissions),
+    # maximum number of UHRs observed
+    max_uhr = max(patient_readmissions),
+    # 25th percentile (Q1) of UHRs per patient
+    q25_uhr = quantile(patient_readmissions, 0.25),
+    # 75th percentile (Q3) of UHRs per patient
+    q75_uhr = quantile(patient_readmissions, 0.75)
+  )
+
+uhr_summary_table <- tibble(
+  'Summary statistic' = c(
+    "Mean UHRs (SD)",
+    "Median UHRs (Q1–Q3)",
+    "Range UHRs (min–max)"
+  ),
+  'Number of 30-day UHRs per index' = c(
+    sprintf("%.1f (%.1f)", uhr_by_across_patient$mean_uhr, uhr_by_across_patient$sd_uhr),
+    sprintf("%.1f (%.1f–%.1f)", uhr_by_across_patient$median_uhr, uhr_by_across_patient$q25_uhr, uhr_by_across_patient$q75_uhr),
+    sprintf("%.1f–%.1f", uhr_by_across_patient$min_uhr, uhr_by_across_patient$max_uhr)
+  )
+)
+
+uhr_summary_table %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>% 
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(
+    values = c(
+      "Note: Patient's UHRs was first summarized by the mean/median for each patient. Patient-level values were
+then used to compute the overall mean (SD) and median (Q1–Q3)/(Min–Max) during the study
+period for all patients."
+    )
+  )  %>%
+  flextable::font(part = "all", fontname = "Century Gothic") %>%
+  flextable::fontsize(part = "all", size = 11) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9)
+```
+# References
