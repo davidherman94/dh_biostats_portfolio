@@ -1,0 +1,676 @@
+---
+title: "Endpoint derivation and modeling workflow (portfolio example)"
+subtitle: "Hospitalization states modeling pipeline"
+author: "David Herman"
+    reference-doc: custom-reference-doc.docx
+---
+
+# Introduction
+
+## Background
+
+
+## Objective
+
+
+## Endpoint
+
+::: {.content-visible when-format="html"}
+
+```{r setup, echo = F}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+options(knitr.kable.NA = "")
+```
+
+```{r}
+#| label: load-functions and config files
+#| echo: false
+#| warning: false
+#| results: false
+
+# Import config file with list of defined variables
+source("../src/config.R") 
+# Import developed functions 
+source("../src/functions.R")
+```
+
+```{r}
+#| label: load-packages
+#| echo: false
+#| warning: false
+#| results: false
+#| message: false
+#| error: false
+#| cache: false
+#| include: false
+
+load_libraries(PACKAGES)
+```
+
+```{r}
+#| label: set-global-defaults-flextable
+#| echo: false
+#| warning: false
+#| message: false
+#| error: false
+#| cache: false
+#| include: false
+
+flextable::set_flextable_defaults(
+  table_align = "center",   
+  align = "left",         
+  font.family = "Redacted_Name",
+  font.size = 10,
+  layout = "autofit"
+)
+```
+
+```{r}
+#| label: Redacted_Name
+#| echo: false
+#| warning: false
+#| message: false
+
+```
+
+```{r}
+#| label: importing-derived-df
+#| echo: false
+#| warning: false
+#| message: false
+
+#' import df for msm exploratory analysis
+#' The derivation is detailed in 1_data_management.qmd
+#' The current df is prepared for modelling with the Andersen-Gill counting
+#'  process approach (long format)
+msm_ag_model_df <- gcs_get_object(
+  "MSM_Hospitalizations/msm_ag_model_cov_long_df.rds",
+  bucket = "YOUR_GCS_BUCKET",
+  parseFunction = gcs_parse_rds)
+```
+
+```{r}
+#| label: fig-diagram-transitions-hospitalization-states
+#| fig-cap: "Diagram of transitions (λ) in patient trajectory across hospitalization states. Black solid lines represent the transitions of interest while grey dashed lines indicate other possible transitions observed in patient trajectories which will not be included in the main analysis."
+#| echo: false
+#| warning: false
+
+grViz("
+digraph multi_state_model {
+
+  rankdir = TB;
+
+  # Node style
+  node [shape = ellipse, style=filled, color=lightgrey, fontsize=6]
+
+  # State nodes
+  Out_of_Hospital [label='1. Out of hospital', fontsize=6]
+  SR              [label='2. SR admission', fontsize=6]
+  Non_SR          [label='3. Non SR admission', fontsize=6]
+
+  # Rank alignment
+  { rank = same; SR; Non_SR }
+
+  # Modeled transitions (solid)
+  Out_of_Hospital -> SR      [label='λ 1→2', fontsize=5, arrowsize=0.6, penwidth=0.8]
+  SR              -> Out_of_Hospital [label='λ 2→1', fontsize=5, arrowsize=0.6, penwidth=0.8]
+  Out_of_Hospital -> Non_SR  [label='λ 1→3', fontsize=5, arrowsize=0.6, penwidth=0.8]
+  Non_SR          -> Out_of_Hospital [label='λ 3→1', fontsize=5, arrowsize=0.6, penwidth=0.8]
+
+  # Other possible transitions between SR and Non-SR (grey, not modeled)
+  SR     -> Non_SR [label='λ 2→3', fontsize=5, style=dashed, color=grey, arrowsize=0.6, penwidth=0.8]
+  Non_SR -> SR     [label='λ 3→2', fontsize=5, style=dashed, color=grey, arrowsize=0.6, penwidth=0.8]
+}
+")
+```
+
+:::
+
+# Descriptive analysis
+
+## Number of transitions per patient
+
+```{r}
+#| label: tbl-aver-transitions
+#| tbl-cap: "Average number of transitions per patient during the entire follow-up period."
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+### Average number of transitions per patient 
+transitions_counts <- msm_ag_model_df %>%
+  # keep distinct states per patient (go back to the one row per obs. format)
+  distinct(
+    patient_uuid,
+    tstart, 
+    tstop,
+    state) %>%
+  # order to obtain the last row per patient correctly
+  arrange(tstart, tstop, .by_group = TRUE) %>%
+  group_by(patient_uuid) %>%
+  mutate(
+    from_state = state,
+    to_state   = lead(state)   # next state
+  ) %>%
+  # remove last state per patient (no next state)
+  # show only transitions of interest (all records are displayed in the appendix)
+  filter(
+  !is.na(to_state) &
+    !(
+      (from_state == "SR admission"      & to_state == "Non-SR admission") |
+      (from_state == "Non-SR admission"  & to_state == "SR admission")
+    )
+  ) %>%
+  # count each transition per patient
+  count(patient_uuid, from_state, to_state) %>%
+  group_by(from_state, to_state) %>%
+  # add patients with 0 transitions of a given type
+  tidyr::complete(
+    patient_uuid = unique(msm_ag_model_df$patient_uuid),
+    fill = list(n = 0)
+  ) 
+
+# Number of patients with at least one transition of each type
+patients_with_transitions <- transitions_counts %>%
+  filter(n != 0) %>%
+  group_by(from_state, to_state) %>%
+  summarise(
+    `Number of patients with ≥1 transition` = sum(n_distinct(patient_uuid)),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(`Number of patients with ≥1 transition`))
+
+# 2) Add patients with 0 transitions of a given type
+transitions_per_patient <- transitions_counts %>%
+  summarise(
+    `Mean (SD)` = paste0(
+      round(mean(n, na.rm = TRUE), 1), " (",
+      round(sd(n,   na.rm = TRUE), 1), ")"
+    ),
+    `Median (Q1, Q3)` = paste0(
+      round(median(n, na.rm = TRUE), 1), " (",
+      round(quantile(n, 0.25, na.rm = TRUE), 1), ", ",
+      round(quantile(n, 0.75, na.rm = TRUE), 1), ")"
+    ),
+    `Min–Max` = paste0(
+      round(min(n, na.rm = TRUE), 1), "–",
+      round(max(n, na.rm = TRUE), 1)
+    ),
+    .groups = "drop"
+  ) %>%
+  rename(`From state` = from_state,
+         `To state`   = to_state) %>%
+  # order by number of transitions
+  arrange(desc(`Min–Max`))  
+
+# Display formatted table
+transitions_per_patient_table <- transitions_per_patient %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(
+    values = c(
+    "Note 1: Counts for each state were first summarized at the patient level, and then the mean and median were computed across patients with at least one transition (N = 49).",
+    "Note 2: 47 patients had ≥1 out-of-hospital→SR admission over follow-up; 45 had ≥1 SR admission→out-of-hospital transition, 45 had ≥1 out-of-hospital→non-SR admission transition, and 46 had ≥1 non-SR admission→out-of-hospital transition.
+    ")
+    ) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9)
+
+transitions_per_patient_table
+```
+
+## Time spent per state per patient
+
+```{r}
+#| label: tbl-prop-time-transitions
+#| tbl-cap: "Time spent (days) per state per patient during the entire follow-up"
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+### Proportion of time spent per state per patient ----------------
+time_spent_per_patient <- msm_ag_model_df %>%
+  # keep distinct states per patient (one row format)
+  distinct(
+    patient_uuid,
+    tstart, 
+    tstop,
+    state,
+    duration_state) %>%
+  group_by(patient_uuid, state) %>%
+  # Total time in state per patient
+  summarise(
+    mean_time_in_state_patient = mean(duration_state, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Calculate total time across all states for each patient based on the mean
+time_spent_per_patient <- time_spent_per_patient %>%
+  group_by(state) %>%
+  summarise(
+    `Mean (SD)` = paste0(
+      round(mean(mean_time_in_state_patient, na.rm = TRUE), 1), " (",
+      round(sd(mean_time_in_state_patient, na.rm = TRUE), 1), ")"
+    ),
+    `Median (Q1, Q3)` = paste0(
+      round(median(mean_time_in_state_patient, na.rm = TRUE), 1), " (",
+      round(quantile(mean_time_in_state_patient, 0.25, na.rm = TRUE), 1), ", ",
+      round(quantile(mean_time_in_state_patient, 0.75, na.rm = TRUE), 1), ")"
+    ),
+    `Min–Max` = paste0(
+      round(min(mean_time_in_state_patient, na.rm = TRUE), 1), "–",
+      round(max(mean_time_in_state_patient, na.rm = TRUE), 1)
+    ),
+  ) %>%
+  rename(State = state)
+
+# Format table with kableExtra
+time_spent_per_patient_table <- time_spent_per_patient %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::add_footer_lines(
+    values = c(
+    "Note 1: The time at each state was obtained by first averaged within each patient and state. Patient-level mean values by state were then used to compute the mean (SD) and median (Q1–Q3)/(Min–Max) during the entire follow-up across patients who met the study eligibility criteria (N = 50).",
+    "Note 2: Time is expressed in days. It was calculated as the difference between tstop and tstart for each state interval."
+    )
+    ) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9)
+
+time_spent_per_patient_table
+```
+
+# Main analysis
+
+::: {.content-visible when-format="html"}
+
+The transition intensities (i.e., transition-specific hazards) between states were estimated using an Andersen–Gill (AG) multi-state Cox-type regression model [@therneau2000; @paes2004; @putter2007; @meira-machado2009; @therneau2020multi; @le-rademacher2022; @therneau2024; @kempf2025].
+
+This model followed the approach of the PTRANSIT** SAS macro described by @paes2004, in which recurrent events are represented as transitions in a continuous-time Markov process with time-varying baseline hazards, giving each transition its own hazard function. The analysis used the AG counting-process formulation [@therneau2000; @paes2004; @castañeda2010], which provides one record per at-risk interval and is suitable for modelling multiple (recurrent) transitions per subject over time.
+
+Because baseline hazards and covariate effects are assumed not to be shared across transitions, the likelihood contribution for each transition can be maximized separately [@kempf2025]. Under this structure, the MSM can be fully specified by separate time-to-event models for each transition, since the form of one transition model does not constrain the others. In this analysis, this was implemented through a single Cox model with a `strata(transition)` term (`survival` package). Although these models are estimated separately, they together form a single multi-state analysis because the likelihood of the multi-state process is obtained by combining the transition-specific likelihood contributions across all transitions [@therneau2000; @kempf2025].
+
+Redacted_Name patients may experience multiple transitions during follow-up, a *robust sandwich covariance matrix* (i.e., `cluster(patient_uuid)`) was used to account for within-subject correlation and provide robust standard errors [@therneau2000; @amorim2014; @kempf2025].
+
+In summary, this model allows for:
+
+-   separate (stratified) baseline hazards for each transition (i.e., baseline hazards are not assumed to be proportional; see [baseline hazard plot](#baselinehazard)), and
+
+-   transition specific covariate effects, and
+
+-   time fixed and varying covariates at each transition.
+
+The proportional hazard assumption was assessed for the final fitted model after the covariate selection procedure with the `cox.zph` function (see in [appendix](#proportionalhazards)).
+
+**Note: The SAS macro is attached in the Hospitalization/src folder in the shared repository.
+
+## Multi-state Cox-type regression model
+
+```{r}
+#| label: structure-msm-ag-model-cov-long-df
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+str(msm_ag_model_df)
+```
+
+```{r}
+#| label: msm-ag-modelling
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+# AG multi-state cox-type regression model performed with survival package.
+#' Note 1: this model without the cluster(patient_uuid) which accounts for 
+#' within-subject correlation, gives exactly the same results as running 
+#' separate transitions 1 <-> 2 and 1 <-> 3 (including argument reverse Y)
+#'  in the PTRANSIT macro SAS from Paes et al (2004).
+#' 
+#' Note 2: the process of using factor(transition):covariates allows to have 
+#' transition-specific effects for each covariate. This process gives exactly 
+#' the same values as creating dummy variables for each transition-covariate 
+#' combination as explained in Therneau and Grambsch (2000) in pag 225. 
+#' Same results are obatined when using strata(transition):(covariates), but 
+#' it was decided to use the factor(transition):covariates notation for clarity 
+#' in the different steps.
+#' 
+#' Note 3: There are 12 records with exact tstpop == tstart which are removed 
+#' when fitting the model. These records were checked and corresponded to 12
+#'  outpatient admissions (ost of them classified as planned procedures).
+
+# Ref level for transition 1-2 for order in output
+msm_ag_model_df$transition <- relevel(msm_ag_model_df$transition, ref = "1-2")
+
+msm_ag_full_model <- coxph(Surv(tstart, tstop, event) ~
+    #' to obtain transition-specific covariate effects
+    factor(transition):(sex_male +
+                          neonatal_onset_yes +
+                          quinidine_at_transition_day +
+                          vns_at_transition_ever +
+                          n_distinct_asm_at_transition_day +
+                          ketogenic_diet_at_transition_day + 
+                          tech_assistance_at_transition_ever
+                        ) + 
+    #' non-proportional baseline hazards assumed, meaning separate base-haz for
+    #'  each transition = running separate Cox models per transition
+    strata(transition) +
+    # to obtain robust standard errors accounting for within-subject correlation in AG models
+    cluster(patient_uuid), 
+  # subset to remove transitions of non-interest
+  data = subset(msm_ag_model_df, transition %in% c("1-2", "2-1", "1-3", "3-1")),
+  ties = "breslow"
+)
+
+summary(msm_ag_full_model)
+```
+
+## Covariate selection
+
+A stepwise backward elimination approach based on the AIC was used to select covariates for the final model. The process used the `stepAIC` function from the `MASS` package, starting from the maximal (full) model and removing one covariate at a time until no further improvement in AIC was observed. The covariate `sex` was forced to remain in the model due to their clinical relevance.
+
+```{r}
+#| label: msm-ag-model-stepwise
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+msm_ag_full_model_stepwise <- stepAIC(
+  msm_ag_full_model,
+  direction = "backward",
+  scope = list(
+    # do not remove (cluster is automatically retained)
+    lower = ~ factor(transition):sex_male
+  ),
+  trace = TRUE
+)
+```
+
+The history of vagus nerve stimulation at transition day (`vns_at_transition_ever`) was the only variable removed during the stepwise backward selection feature.
+
+In the obtained model, no interactions between covariates were considered due to the current complexity of the model and lack of clinically relevant interactions to explore.
+
+After verifying the proportional hazards assumption (see in [appendix](#proportionalhazards)), the final model obtained from the stepwise procedure was retained as *main effects model*.
+
+*Note: the main effects model was also fitted without `neonatal_onset_yes` due to the evidence of non proportional hazards for that covariate in transition 1→2. The estimated effects were similar to those from the main effects model and are not shown here. Thus, it was decided to retain neonatal_onset_yes in the final model due to its clinical relevance and previous association in the SR admission endpoint analysis.*
+
+:::
+
+## Estimated effects for each transition
+
+```{r}
+#| label: tbl-multi-state-cox-model-results
+#| tbl-cap: "Estimated adjusted Redacted_Name (95% CI) for four types of transition in final multi-state Cox model (fixed effects)"
+#| echo: false
+#| warning: false
+#| results: 'asis'
+
+# 1) Tidy model output
+tbl <- tidy(msm_ag_full_model_stepwise, exponentiate = TRUE, conf.int = TRUE) %>%
+  dplyr::select(term, estimate, conf.low, conf.high) %>%
+  mutate(
+    HR = sprintf("%.2f (%.2f, %.2f)", estimate, conf.low, conf.high),
+    Transition = gsub("transition", "", sub(":.*", "", term)),
+    Covariate  = sub(".*:", "", term)
+  ) %>%
+  dplyr::select(Transition, Covariate, HR)
+
+# 2) Wide table (one column per transition)
+tbl_wide <- tbl %>%
+  pivot_wider(names_from = Transition, values_from = HR) %>%
+  mutate(
+    Covariate = case_when(
+      Covariate == "sex_male" ~ "Sex (Ref: Female)",
+      Covariate == "quinidine_at_transition_day" ~ "Quinidine treatment at transition start day (Ref: No)",
+      Covariate == "n_distinct_asm_at_transition_day" ~ "Number of prescribed ASMs at transition day",
+      Covariate == "ketogenic_diet_at_transition_day" ~ "Ketogenic dietary intervention at transition day (Ref: No)",
+      Covariate == "tech_assistance_at_transition_ever" ~ "History of technology assistance at transition day (Ref: No)",
+      Covariate == "neonatal_onset_yes" ~ "Neonatal disease onset (Ref: No)",
+      TRUE ~ Covariate
+    )
+  )
+
+# 3) Ensure expected columns exist and order them
+col_order <- c("Covariate", "factor()1-2", "factor()2-1", "factor()1-3", "factor()3-1")
+
+tbl_wide <- tbl_wide %>%
+  mutate(across(setdiff(col_order, names(.)), ~ NA_character_)) %>%
+  dplyr::select(any_of(col_order))
+
+# 4) Rename transition columns to descriptive headers and create flextable
+tbl_cox_ag_msm <- tbl_wide %>%
+  rename(
+    `OOH → SR admission \nHR (95% CI)`     = `factor()1-2`,
+    `SR admission → OOH \nHR (95% CI)`     = `factor()2-1`,
+    `OOH → Non-SR admission \nHR (95% CI)` = `factor()1-3`,
+    `Non-SR admission → OOH \nHR (95% CI)` = `factor()3-1`
+  ) %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  add_footer_lines(values = c(
+    "Abbreviations: CI, confidence interval; HR, hazard ratio; OOH, out-of-hospital;  Non-SR, non-seizure-related; SR, seizure-related.",
+    "Note 1: HR represent the relative change in the hazard of transitioning between states while holding other covariates constant. For categorical covariates, HR compare the hazard of transition for individuals with the characteristic to those without it. For continuous covariates, HR indicate the change in hazard per unit increase in the covariate.",
+    "Note 2: For neonatal onset in the OOH → SR transition, the proportional hazards assumption was violated. The HR therefore reflects an average association across all event times, not a constant effect that applies uniformly over follow up."
+  )) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9)
+
+tbl_cox_ag_msm
+```
+
+# Appendix {#appendix}
+
+::: {.content-visible when-format="html"}
+
+## Data layout
+
+The data layout used for the multi-state Cox model with AG counting process approach is shown below. Each patient contributes one row per time interval during which their covariates remain constant and they are at risk for one specific transition.
+
+Each row of the dataset below corresponds to a potential transition between states, with:
+
+-   tstart and tstop defining the risk interval,
+
+-   event indicating whether the transition occurred at tstop,
+
+-   transition identifying which state change the row corresponds to (for example 1→2, 1→3, etc),
+
+-   and covariates evaluated at or before the transition day.
+
+```{r}
+#| label: tbl-layout-transitions-all-transitions
+#| tbl-cap: "Data layout for multi-state model"
+#| echo: false
+#| results: 'markup'
+
+msm_ag_model_df %>%
+  mutate(patient_seq_id = as.numeric(factor(patient_uuid))) %>%
+  dplyr::select(
+    patient_seq_id,
+    tstart,
+    tstop,
+    event,
+    transition,
+    sex_male,
+    n_distinct_asm_at_transition_day
+  ) %>%
+  arrange(patient_seq_id, tstart) %>%
+  slice(1:26) %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) %>%
+  flextable::italic(part = "footer", italic = TRUE) %>%
+  flextable::align(part = "footer", align = "left") %>%
+  flextable::fontsize(part = "footer", size = 9)
+```
+
+## Model assumptions
+
+### Baseline hazard plots {#baselinehazard}
+
+Even though the assumed baseline hazard could be shared for some transitions (e.g., 1→2 and 1→3) [@putter2007], separate baseline hazards were assumed for all transitions in order to follow the methodology proposed by @paes2004, which still allows to obtain transition specific covariate effects.
+
+```{r}
+#| label: baseline-hazard-plots
+#| echo: false
+#| warning: false
+
+#' Checking plot of proportional baseline hazards following Therneau 2000 and
+#'  Castañeda et al. (2010) to assess the need for separate baseline hazards
+
+# function to run one cox model per transition and extract baseline hazard
+transitions <- c("1-2", "2-1", "1-3", "3-1")
+
+bh_list <- lapply(transitions, function(tr) {
+  # fit model for one transition
+  fit_tr <- coxph(
+    Surv(tstart, tstop, event) ~
+      sex_male + neonatal_onset_yes +
+      quinidine_at_transition_day + vns_at_transition_ever + 
+      n_distinct_asm_at_transition_day + ketogenic_diet_at_transition_day +
+      tech_assistance_at_transition_ever +
+      cluster(patient_uuid),
+    data  = subset(msm_ag_model_df, transition == tr),
+    ties  = "breslow"
+  )
+  
+  #' extract baseline hazard for the transition (alias function to simplify 
+  #' surfit by Therneau 2000 example; checked and gave same results)
+  bh_tr <- basehaz(fit_tr, centered = FALSE)
+  bh_tr$transition <- tr
+  bh_tr
+})
+
+bh_all <- bind_rows(bh_list)
+
+# plot all baseline hazards together
+ggplot(bh_all, aes(x = time, y = hazard, color = transition)) +
+  geom_step() +
+  labs(
+    x = "Time",
+    y = "Cumulative baseline hazard",
+    color = "Transition",
+    title = "Estimated cumulative baseline hazards per transition"
+  ) +
+  theme_minimal()
+```
+
+### Proportional hazards assumption {#proportionalhazards}
+
+For testing this assumption, first, a general global tests from the fully stratified model were used as an overall diagnostic, which indicates whether any covariate violates the proportional hazards assumption across all transitions [@therneau2024; @kempf2025].
+
+```{r}
+#| label: fig-coxph-proportional-hazards-assumption-full-model
+#| echo: false
+#| warning: false
+
+#' Testing proportional hazards assumption with Schoenfeld residuals following
+#'  Therneau 2000, 2024 and Castañeda et al. (2010)
+#'  Test in cox.zph are for a linear effect on the chosen time scale
+coxph_assumption <- cox.zph(msm_ag_full_model_stepwise)
+# Display results
+coxph_assumption
+```
+
+This global test indicated evidence of non proportional hazards for `neonatal_onset_yes` and `ketogenic_diet_at_transition_day`.
+
+As the model uses separate baseline hazards for each transition via strata(transition), the proportional hazards assumption was also assessed within each transition (i.e., 1→2, 2→1, 1→3, and 3→1) by fitting separate Cox models and inspecting Schoenfeld residual. These tests evaluate whether the transition-specific effect of each covariate changes with time.
+
+In these transition-specific models, `neonatal_onset_yes` again showed clear evidence of non proportional hazards for the 1→2 transition, meaning that the effect of neonatal onset on the hazard of transitioning from out-of-hospital to seizure-related admission changes over time. For the other transitions, there was no strong evidence of violation for any individual covariate. This means that the significant global test for `neonatal_onset_yes` was likely driven by the 1→2 transition while for `ketogenic_diet_at_transition_day`, no specific transition showed strong evidence of non proportionality.
+
+Because neonatal onset is clinically important, it was retained in the final model. Under these conditions, the regression coefficient for that transition represents an average log hazard ratio over the observed follow up rather than a strictly time constant effect [@jones2016immortal]. In practical terms, this means the HR summarises the overall association across all event times, even though the true effect may be stronger at some points in time and weaker at others. This occurs because the Cox model averages the effect over the times at which events happen, giving equal weight to early and late events [@bellera2010variables]. Alternatively, a more complex model may be required to better characterise the time dependent effect of neonatal onset for the 1→2 transition [@kuitunen2021testing; @therneau2024], which is beyond the scope of this exploratory analysis.
+
+```{r}
+#| label: coxph-proportional-hazards-assumption-per-transition
+#| echo: false
+#| warning: false
+
+#' function to fit and test the cox.zph assumption for each transition from
+#'  the model obtained in from the stepwise procedure
+ph_test_one_transition <- function(tr) {
+  cat("\n=============================\n")
+  cat("Transition:", tr, "\n")
+  cat("=============================\n")
+  
+  fit_tr <- coxph(
+    Surv(tstart, tstop, event) ~
+      sex_male +
+      neonatal_onset_yes +
+      quinidine_at_transition_day +
+      n_distinct_asm_at_transition_day +
+      ketogenic_diet_at_transition_day +
+      tech_assistance_at_transition_ever +
+      cluster(patient_uuid),
+    data = subset(msm_ag_model_df, transition == tr),
+    ties = "breslow"
+  )
+  
+  zph_tr <- cox.zph(fit_tr)
+  print(zph_tr)
+  
+  # plot Schoenfeld residuals for each covariate and transition
+  par(mfrow = c(2, 3))
+  plot(zph_tr, main = paste("Schoenfeld residuals for", tr), df = 2)
+}
+
+# run it for all four transitions
+# transitions vector defined above in baseline hazards
+ph_results_list <- lapply(transitions, ph_test_one_transition)
+names(ph_results_list) <- transitions
+```
+
+:::
+
+## Complementary tables
+
+### Total number of observations per transition
+
+```{r}
+#| label: tbl-total-transitions
+#| tbl-cap: "Total number of transitions observed during the entire follow-up period."
+#| echo: false
+#| warning: false
+#| results: 'markup'
+
+### total (raw) number of transitions per patient 
+total_ransitions_per_patient <- msm_ag_model_df %>%
+  # keep distinct states per patient (go back to the one row per obs. format)
+  distinct(
+    patient_uuid,
+    tstart, 
+    tstop,
+    state) %>%
+  # order to obtain the last row per patient correctly
+  arrange(tstart, tstop, .by_group = TRUE) %>%
+  group_by(patient_uuid) %>%
+  mutate(
+    from_state = state,
+    to_state   = lead(state)   # next state
+  ) %>%
+  # remove last state per patient (no next state)
+  filter(!is.na(to_state)) %>%
+  count(patient_uuid, from_state, to_state) %>%
+  group_by(from_state, to_state) %>%
+  summarise(
+    `Total transitions` = sum(n, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(`From state` = from_state,
+         `To state`   = to_state) %>%
+  arrange(desc(`Total transitions`))
+
+# Display formatted table
+total_ransitions_per_patient_table <- total_ransitions_per_patient %>%
+  flextable::regulartable() %>%
+  flextable::autofit() %>%
+  flextable::bold(part = "header", bold = TRUE) 
+
+total_ransitions_per_patient_table
+```
+
+# References
