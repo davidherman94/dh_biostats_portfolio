@@ -1,0 +1,3366 @@
+---
+title: "Data management and modeling pipeline (portfolio example)"
+subtitle: "Section 1: data management"
+author: "Redacted"
+css: styles.css
+---
+
+```{r setup, echo = F}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+options(knitr.kable.NA = "")
+```
+
+#Load config, functions files and import data from GCP
+
+```{r}
+#| label: load-functions and config files
+#| echo: false
+#| warning: false
+#| results: false
+
+#' Import config file: includes list of packages used accross reports
+#' and files to upload from cloud
+source("../src/config.R") 
+# Import all developed functions: import data, load packages, readmission_find...
+source("../src/functions.R")
+```
+
+```{r}
+#| label: load-packages
+#| echo: false
+#| warning: false
+#| results: false
+#| message: false
+#| error: false
+#| cache: false
+#| include: false
+
+load_libraries(PACKAGES)
+```
+
+```{r}
+#| label: import-data
+#| echo: false
+#| warning: false
+#| results: false
+#| message: false
+#| include: false
+
+# Client Authentification
+# do not displayed
+
+# Import epilepsy-related genes for genetic mutation variable derivation
+# Source https://bahlolab.github.io/Genes4Epilepsy/
+gene4epilepsy_list_202503 <- gcs_get_object(
+  "gene4epilepsy/gene4epilepsy_list_202503.rds",
+  bucket = "YOUR_GCS_BUCKET",
+  parseFunction = gcs_parse_rds
+)
+```
+
+# Variable derivation based on the statistical analyses plan
+
+## Seizure-related admissions and length of hospital stay (LOHS) derivation
+
+```{r}
+#| label: Derivation of hospitalization-related variables from admission dataset
+#| results: false
+
+# Definitions:
+#' Length of hospital stay (LOHS):
+#' The LOHS for each hospital admission record from the “Hospital Admission”
+#' dataset will be coded as a quantitative variable describing the difference
+#'  in days between the admission date (“admission_age_days_firstDate”) and
+#'   discharge date (“admission_age_days_lastDate”) plus one
+#'   (to account for the inclusion of the admission day in the duration).
+#'    Additionally, the LOHS will be derived as categorical variable based on
+#'    tertiles (i.e., bottom, middle, and top tertiles), as proposed
+#'    by Han TS et al., (2022).
+
+#' SR admission diagnosis:
+#' This variable will be treated as a binary variable (i.e., coded as “yes”/”no”)
+#' indicating whether a hospital admission record from the “Hospital Admission”
+#'  dataset has a seizure-related diagnosis. A seizure-related diagnosis will be
+#'   identified based on the variable ‘admission_diagnosis‘ in the "Hospital
+#'   Admission" dataset. Admission diagnoses records will be classified as
+#'   seizure-related type if they contain any of the following terms: “seizure,
+#'   ” “epilepsy,” or “status epilepticus”
+
+#' Note 1: for derivation of all binary variables:
+#' Although binary variables in the SAP are defined as "yes"/"no" to improve
+#' readability in documentation, they were implemented in the analysis
+#' code using 0 and 1 for practical and computational efficiency.
+
+#' Note 2: this df will be used as main input for the derivation of the rest
+#' of covariates and 30-day UHRs in the following steps
+
+#' Seizure event terms detected with the words:
+#'  “seizure,” “epilepsy,” & “status epilepticus”
+SEIZURE_EVENT <- c(
+  "Increased seizure frequency", # 'seizure' term
+  "Seizure disorder", # 'seizure' term
+  "Epilepsy monitoring unit admission", # 'epilepsy' term
+  "Epilepsy", # 'epilepsy' term
+  "Status epilepticus" # 'status epilepticus' term
+)
+
+# Admission diagnoses with the word "birth"
+#' Prematurity of infant is not included as it is a disorder on SNOMED
+#' It was checked and revised with PEs.
+BIRTH_EVENT <- c(
+  "Birth",
+  "Term birth of newborn",
+  "Preterm birth"
+)
+
+# Considered planned admission diagnoses with the word "planned"
+PLANNED_EVENT <- c(
+  "Planned procedure",
+  "Planned admission",
+  "Planned admission for research study"
+)
+
+hospital_admission_rec <- rare_hospital_admission %>%
+  # Select variables of interest
+  dplyr::select(
+    # Patient UUID
+    patient_uuid,
+    # Admission age date
+    admission_age_days_firstDate,
+    # Discharge age date
+    admission_age_days_lastDate,
+    # Admission diagnosis
+    admission_diagnosis
+  ) %>%
+  # derive variables of interest
+  mutate(
+    # Flag birth admissions
+    birth_admission = factor((admission_diagnosis %in% BIRTH_EVENT) * 1),
+
+    # Flag birth admissions
+    planned_admission = factor((admission_diagnosis %in% PLANNED_EVENT) * 1),
+
+    # Flag outpatient admissions (admission and discharge in the same day)
+    outpatient_admission = factor((
+      admission_age_days_firstDate == admission_age_days_lastDate) * 1),
+
+    # Derivation of continuous length of hospital stays in days
+    length_of_stay_days =
+      (admission_age_days_lastDate - admission_age_days_firstDate) + 1,
+
+    #' Derivation of length of hospital stays in 3 categories by tertiles
+    length_of_stay_days_cat = cut(
+      length_of_stay_days,
+      # cut in tertiles
+      quantile(
+        length_of_stay_days,
+        c(0:3 / 3)
+      ),
+      include.lowest = T,
+      labels = c("Bottom", "Middle", "Top")
+    ),
+
+    # Derivation of age at hospital admission in years
+    age_admission_yr = as.numeric(admission_age_days_firstDate / 365.25),
+
+    # Determine type of admission diagnosis based on seizures/epilepsy
+    seizure_related_admission = factor((admission_diagnosis %in% SEIZURE_EVENT
+      ) * 1,
+      # having not seizure-related as reference
+      levels = c(0, 1)
+    )
+  ) %>%
+  #' Remove duplicated based on patient age at admission day, patient age at
+  #'  discharge day, admission diagnosis and patient unique identifier
+  distinct(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    admission_diagnosis,
+    .keep_all = TRUE
+  ) %>%
+  # Select and order variables of interest
+  dplyr::select(
+    patient_uuid,
+    age_admission_yr,
+    admission_diagnosis,
+    seizure_related_admission,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    length_of_stay_days,
+    length_of_stay_days_cat,
+    birth_admission,
+    planned_admission,
+    outpatient_admission
+  ) %>%
+  # Sort by patient and the first day of hospitalization
+  arrange(patient_uuid, admission_age_days_firstDate)
+```
+
+## Sex variable derivation
+
+```{r}
+#| label: patient sex
+#| results: false
+
+#' Definition:
+#' Patient sex at birth will be defined as a categorical variable
+#' according to the “sex” variable from the “Demographics” dataset.
+
+demographics_rec <- rare_disease_demographics %>%
+  # check deceased patients with admission history data
+  dplyr::select(
+    patient_uuid,
+    sex
+  ) %>%
+  mutate(
+    sex = factor(sex, levels = c("female", "male"))
+  )
+```
+
+## Follow-up variable derivation
+
+```{r}
+#| label: patient follow-up days
+#| results: false
+#' Definition:
+#' Patient age (in days) at first record will be identified for each patient,
+#'  by extracting the minimum patient age from all the patient’s records across
+#'   all datasets (i.e., listed in Section 3.3). It will be defined as a 
+#'   quantitative variable and will be converted into months and years using 
+#'   the conversion conventions described in Section 4.1.
+
+#' Patient age (in days) at last record will be identified for each patient, by
+#'  extracting the maximum patient age from all the patient’s records across all
+#'   datasets (i.e., listed in Section 3.3). It will be defined as a quantitative
+#'    variable and will be converted into months and years using the conversion
+#'     conventions described in Section 4.1.
+
+followup_rec <- rare_disease_followup_durations_days %>%
+  # Select variables of interest
+  dplyr::select(
+    patient_uuid,
+    first_record_age_days,
+    last_record_age_days
+  )
+```
+
+## Flag deceased patients
+
+```{r}
+#| label: flag deceased patients
+#| results: false
+#' Definition based on patient age at death:
+#' Patient age (in days) at death will be defined from the “Primary Diagnosis”
+#' dataset. It will be defined as a quantitative variable, and its value will
+#'  be based on the “primary_diagnosis_age_days” variable at the death record.
+#'  This variable will only be computed for the patients with a documented death.
+
+# Identify id of deceased patients and date of death for further use
+deceased_patients <- rare_disease_primary_diagnosis %>%
+  filter(primary_diagnosis == "Deceased") %>%
+  dplyr::select(
+    patient_uuid,
+    primary_diagnosis_age_days
+  )
+```
+
+## 30-day UHRs derivation (derived from prior output df)
+
+```{r}
+#| label: 30-day unplanned hospital readmissions (UHR) derivation
+#| results: false
+
+#' Definition:
+#' Raw hospital admissions records will be used to derive the 30-day UHR outcome.
+#'  A hospital admission record will be considered as a healthcare episode in 
+#'  which a patient is admitted to a hospital facility with more than 24 hs
+#'  It will be defined by an admission start day and
+#'    the discharge day variables, which are dated to a specific patient age 
+#'    in days in the “Hospital admission” database:  
+#'    
+#'    - Admission start day: patient age at admission day 
+#'    (variable ”admission_age_days firstDate”)  
+#'  
+#'    - Discharge day: patient age at discharge day 
+#'    (variable “admission_age_days_lastDate”)   
+#'    
+#'  “Planned”, “birth” and outpatient admissions admission diagnosis reasons
+#'     will be excluded from the analysis.
+#'    
+#'  Each hospital admission record occurring after an index discharge day 
+#'    (discharge day of a hospital admission that marks the start of a 30-day 
+#'    observation window) will be assessed to determine if it corresponds to a 
+#'    30-day UHR event.If multiple 30-day UHRs occur within the same 30-day 
+#'    window after last index discharge date, all hospital admission records
+#'     will be counted. After this 30-day period, any subsequent hospital 
+#'     admission is considered a new index admission (with a respective index 
+#'     discharge day), initiating a new 30-day observation window.  
+
+# 1) Flag index and UHRs-------------------------------------------------------
+#' Find index and 30-day readmissions function in scr/functions.R
+hospital_readmission_rec <- hospital_admission_rec %>%
+  # Filtering out birth, planned and outpatient admissions from derivation
+  filter(birth_admission == 0 &
+           planned_admission == 0 &
+           outpatient_admission == 0
+         ) %>%
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' The "find_readmissions" function identifies and flags all admissions that
+  #' occur within 30 days after an index admission
+  find_readmissions(
+    grouping = "patient_uuid",
+    start_date = "admission_age_days_firstDate",
+    end_date = "admission_age_days_lastDate"
+  ) %>%
+  arrange(patient_uuid, admission_age_days_firstDate)
+
+
+# 2) Count of 30-day UHRs per index admission --------------------------
+#' Generate df with final count of 30-day UHR (count readmissions)
+#' per index admission with time under exposure (exptime) to use as offset
+hospital_readmission_counts_rec <- hospital_readmission_rec %>%
+  # Bring in deceased patient information
+  left_join(deceased_patients, by = "patient_uuid") %>%
+  # Bring last record age days to calculate last exposure time at risk
+  left_join(
+    rare_disease_followup_durations_days %>% dplyr::select(
+      patient_uuid,
+      last_record_age_days
+    ), by = "patient_uuid"
+  ) %>%
+  #' Exclude admission records in which the patient died during during the
+  #' admission period, but keeping previous admissions.
+  #' Note: The 2 deceased patients did not died at the hospital
+  filter(!(patient_uuid %in% deceased_patients &
+    primary_diagnosis_age_days >= admission_age_days_firstDate &
+    primary_diagnosis_age_days <= admission_age_days_lastDate)) %>%
+  # order by patient and admission date
+  arrange(patient_uuid, admission_age_days_firstDate) %>%
+  # identify 30-day readmissions for each index admission
+  group_by(patient_uuid) %>%
+  mutate(
+    
+    # flag index admissions based on readmission variable
+    index_admission = if_else(readmission == "index", 1, 0),
+
+    # create a sequential number for each index admission within patient
+    index_number = cumsum(index_admission),
+
+    # flag last index admission for each patient for exptime derivation
+    last_index = if_else(index_number == max(index_number), 1, 0),
+
+    # flag 30-day readmissions
+    is_uhr = str_detect(readmission, "30_days_uhr")
+  ) %>%
+  # Group by patient and index number
+  group_by(patient_uuid, index_number) %>%
+  mutate(
+    # count readmissions for each index
+    count_readmissions = sum(is_uhr, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  #  Keep only index admissions
+  filter(index_admission == 1) %>%
+  #' Define exposure time (exptime) which follows each index admission:
+  #' Use 30 days as default unless censored earlier for last index admission
+  #' Note: 6 index had a offset different to 30 days (2 of these with 0 days)
+  mutate(
+    exptime = as.integer(
+      case_when(
+        last_index == 1 &
+          #' if diff between last record and admission last day is less than 30, 
+          #' put the difference as exptime
+          (last_record_age_days - admission_age_days_lastDate < 30) ~
+          last_record_age_days - admission_age_days_lastDate,
+        # otherwise, default exptime is 30 days by definition
+        TRUE ~ 30
+      )
+    )
+  ) %>%
+  #' Exclude exp time = 0 (i.e., last record == admission last day),
+  #' as there is no time to follow up and count uhr after last index admission
+  #' Note: 2 index admissions with this condition
+  filter(exptime > 0) %>%
+  # order, rename and select variables of interest
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    count_readmissions,
+    exptime
+  )
+```
+
+## Technological assistance variable derivation
+
+```{r}
+#| label: tech assistance during hospitalizations
+#| results: false
+
+#' Definition:
+#' The presence of technological assistance prior to hospital admissions
+#'  will be computed from the “Therapeutic procedures” and “Hospital admission”
+#'   datasets. It will be derived as a binary variable for each hospital
+#'    admission record, defined as “yes” if the patient received at least one 
+#'    procedure identified as technological assistance on or before the start 
+#'    of the hospital admission (variable "admission_age_days firstDate"), 
+#'    and “no” otherwise.  
+#'    
+#' Technological assistance procedures will be identified based on the 
+#' procedure variable, using the predefined terms: “gastrostomy”, 
+#' “tracheostomy”, “ventricular shunt”, “indwelling”, “nasogastric”,
+#'  “orogastric”, “jeujostomy” and “gastrojejunostomy”, as defined
+#'   by Harini (2023). The earliest recorded date of any technological 
+#'   assistance procedure for each patient will be identified using the 
+#'   variables ‘procedure_age_days_firstDate’ or ‘procedure_age_days_date’, 
+#'   if available 
+
+# List of terms used to detect technological assistance procedures
+#' Note: orogastric, jejunostomy and gastrojejunostomy terms were added to the 
+#' prior definition to get related events after reviewing events with 
+#' pharmaco-epidemiologist
+#' Note 2: indwelling catheter doens't have an equivalent in RWD patients.
+
+TECH_ASSISTANCE_TERMS <- c(
+  "gastrostomy", # includes "Insertion of gastrostomy tube", among others.
+  "tracheostomy", # includes "Tracheostomy"
+  "ventriculoperitoneal shunt", # includes "Revision of ventriculoperitoneal shunt"
+  "nasogastric", # includes "Insertion of nasogastric tube"
+  "orogastric", # includes "Insertion of orogastric tube",
+  "jejunostomy", # includes "Insertion of jejunostomy tube", among others
+  "gastrojejunostomy" # includes "fluoroscopy guided gastrojejunostomy tube procedure"
+)
+
+# create df to get the first tech procedure for each patient
+first_tech_assistance_proc <- rare_disease_therapeutic_procedures %>%
+  # filter procedures which matches with defined terms
+  filter(
+    str_detect(
+      procedure,
+      regex(paste(TECH_ASSISTANCE_TERMS, collapse = "|"), ignore_case = TRUE)
+    )
+  ) %>%
+  # extract one date for each record in case procedure_age_days_date is NA
+  mutate(
+    procedure_date = coalesce(
+      procedure_age_days_date, 
+      procedure_age_days_firstDate)
+  ) %>%
+  arrange(patient_uuid, procedure_date) %>%
+  group_by(patient_uuid) %>%
+  #' Select the row(s) with the earliest date for each patient.
+  slice_min(procedure_date, with_ties = FALSE) %>%
+  summarise(
+    # earliest data with a technological assistance
+    # no time window after the date of the procedure (immediate effect)
+    first_event_date = procedure_date,
+    # name of the earliest technological assistance to check device
+    name_first_proc = procedure
+  ) %>%
+  ungroup()
+
+# match hospitalization records with first_tech_assistance dates
+first_tech_assistance_proc_rec <- hospital_admission_rec %>%
+  left_join(
+    first_tech_assistance_proc,
+    by = "patient_uuid"
+  ) %>%
+  #' create tech assistance binary variable Presence "1" or absence "0"
+  #' indicating if before or at hospitalization event, the patient had at least
+  #' 1 or more tech assistance procedures on or before the admission day.
+  mutate(
+    tech_assistance_ever = factor( 
+      (!is.na(first_event_date) &
+         admission_age_days_firstDate >= first_event_date) * 1,
+      levels = c(0, 1)
+  )) %>%
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    tech_assistance_ever
+  )
+```
+
+## Vagus Nerve Stimulation variable derivation
+
+```{r}
+#| label: vagal nerve stimulation insertion 
+#| results: false
+
+#' Definition:
+#' The presence of VNS prior to hospital admissions will be computed from 
+#' the “Therapeutic procedures” and “Hospital admission” datasets. It will be
+#'  derived as a binary variable for each hospital admission record, defined 
+#'  as “yes” if the patient received at least one procedure identified as VNS
+#'   insertion on or before the start of the hospital admission (variable
+#'    "admission_age_days firstDate"), and “no” otherwise.  
+#'  VNS insertion procedures will be identified from records in the ‘procedure’
+#'   variable with the term “vagal nerve stimulator”. The earliest recorded 
+#'   date of VNS insertion for each patient will be identified using the 
+#'   variables ‘procedure_age_days_firstDate’ or ‘procedure_age_days_date’,
+#'    if available. Additionally, the effective period of a VNS insertion will
+#'     be assumed to begin 14 days after the insertion date for each patient, 
+#'     in line with the device activation period.
+
+VNS_INSERTION <- "vagal nerve stimulator" # includes insertion and replacement
+
+# create df to get the first tech procedure for each patient
+first_vns_insertion_proc <- rare_disease_therapeutic_procedures %>%
+  # filter only procedures with VNS based on the agreed term
+  filter(
+    str_detect(
+      procedure,
+      regex(paste(VNS_INSERTION, collapse = "|"), ignore_case = TRUE)
+    )
+  ) %>%
+  # Create unified date column in case procedure_age_days_date is NA
+  mutate(
+    procedure_date = coalesce(
+      procedure_age_days_date, 
+      procedure_age_days_firstDate) 
+  ) %>%
+  arrange(patient_uuid, procedure_date) %>%
+  group_by(patient_uuid) %>%
+  # Select the row(s) with the earliest date for each patient
+  slice_min(procedure_date, with_ties = FALSE) %>%
+  summarise(
+    # first event data with assummed 14 days of effect after insertion
+    first_event_date = procedure_date + 14,
+    # name of the procedure
+    name_first_proc = procedure,
+    .groups = "drop"
+  )
+
+# match hospitalization records with vns dates
+first_vns_insertion_proc_rec <- hospital_admission_rec %>%
+  left_join(
+    first_vns_insertion_proc,
+    by = "patient_uuid"
+  ) %>%
+  #' create vns_insertion binary variable Presence "1" or absence "0"
+  #' indicating if for each hospitalization event, the patient had at least 
+  #' 1 vns_insertion procedures on or before the admission day. 
+  mutate(
+    vns_insertion_ever = factor(
+      (!is.na(first_event_date) &
+         admission_age_days_firstDate >= first_event_date) * 1
+      )) %>%
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    vns_insertion_ever
+  )
+```
+
+## Ketogenic diet variable derivation
+
+```{r}
+#| label: Ketogenic diet during hospitalizations
+#| results: false
+#| warning: false
+#| message: false
+
+#' Definition:
+#' The use of ketogenic diet treatment during hospital admissions will be 
+#' computed from the “Therapeutic procedures” and “Hospital admission” datasets.
+#'  It will be derived as a binary variable for each hospital admission record,
+#'   defined as “yes” if the period of a ketogenic diet procedure (defined by
+#'    the variables ‘procedure_age_days_firstDate’ and 
+#'    ‘procedure_age_days_lastDate’) coincides with at least one day of the 
+#'    admission period, and “no” otherwise. Only procedures 
+#'    recorded as “Ketogenic diet” in the ‘procedure’ variable will be 
+#'    considered. Additionally, the effective period of a ketogenic diet
+#'     procedure will be assumed to start 14 days after the start date of the 
+#'     ketogenic diet for each patient (Kosssof et al 2007). 
+
+KETOGENIC_DIET <- "Ketogenic diet" 
+
+ketogenic_diet_episodes <- rare_disease_therapeutic_procedures %>%
+# Filter for ketogenic diet procedures only
+  filter(procedure %in% KETOGENIC_DIET) %>%
+  #' Computing ketogenic diet episodes with 5 days of grace period 
+  #' between interventions
+  group_by(patient_uuid) %>% 
+  mutate(episode_lag = procedure_age_days_firstDate - 
+           lag(procedure_age_days_lastDate, default = T), 
+         episode_rank = purrr::accumulate(
+           abs(episode_lag) > 5, sum, na.rm = T)) %>% 
+  # group by patient and episode rank
+  group_by(patient_uuid, episode_rank) %>% 
+  # #' compute the effective start day (day in which the intervention start to have
+  # #' an effect) and the last day based on episodes
+  # #' summarize to merge if records with a lag of < 5 days (only one patient)
+  summarise(
+    keto_effective_first_day= min(procedure_age_days_firstDate) + 14, # 14th day is considered stable 
+    keto_effective_last_day = max(procedure_age_days_lastDate),
+    .groups = "drop"
+  ) %>%
+  #' remove episodes with no effective days as the length of the intervention
+  #'  was less equal or less than 14 days.
+  filter(keto_effective_first_day <= keto_effective_last_day)
+
+#'Create df to get the first ketogenic diet procedure for each patient and
+#' hospitalizations in which the patient was under effective keto diet
+
+# a. Derivation of ketogenic diet during admission period for 30-day and lohs analyses
+adm_keto_overlap <- hospital_admission_rec %>%
+  left_join(
+    ketogenic_diet_episodes,
+# Check for overlap between *effective* procedure window and admission
+  #' any part of the period starting from day 14 to the end of the
+  #' ketogenic treatment overlaps with the admission
+    join_by(
+      patient_uuid,
+      overlaps(
+        admission_age_days_firstDate,
+        admission_age_days_lastDate,
+        keto_effective_first_day,
+        keto_effective_last_day
+      )
+    )
+  ) %>%
+    # Summarise as binary presence indicator per admission
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+    #' Summarise a binary variable indicating was under ketogenic diet
+  #'  for each hospital admission record (at least one day of match)
+  summarise(
+    #' if there is a match between the effective period of the
+    #' ketogenic diet and the admission period, then it is an 1
+    ketogenic_diet_admission = factor(any(!is.na(keto_effective_first_day)) * 1),
+    .groups = "drop"
+  )
+
+# b. Derivation of ketogenic diet at admission day for sr analysis
+adm_keto_on_admday <- hospital_admission_rec %>%
+  left_join(
+    ketogenic_diet_episodes,
+    # Check for overlap between *effective* procedure window and admission
+  #' any part of the period starting from day 14 to the end of the
+  #' ketogenic treatment overlaps with the admission
+    join_by(
+      patient_uuid,
+      between(admission_age_days_firstDate,
+              keto_effective_first_day,
+              keto_effective_last_day)
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' Summarise a binary variable indicating was under ketogenic diet
+  #'  for each hospital admission record (if there is a match at the day of admission)
+  summarise(
+    #' if the admission day is within the effective period, yes = 1, otherwise 0
+    ketogenic_diet_at_admission_day = factor(any(!is.na(keto_effective_first_day)) * 1),
+    .groups = "drop"
+  )
+
+ketogenic_during_admission_rec <- adm_keto_overlap %>%
+  left_join(
+    adm_keto_on_admday,
+    by = c(
+      "patient_uuid",
+      "admission_age_days_firstDate",
+      "admission_age_days_lastDate"
+    )
+  )
+```
+
+## Respiratory support during admissions derivation
+
+```{r}
+#| label: Respiratory support during admission - derivation
+#| results: false
+
+#' Definition:
+#' Respiratory support procedures performed during hospital admissions will 
+#' be computed from the “Therapeutic Procedures”, “Clinical Diagnosis” and 
+#' “Hospital admission” datasets. It will include invasive and non-invasive 
+#' respiratory support procedures to maintain or restore respiratory function.
+#'  It will be derived for hospital admission record as a binary variable 
+#'  defined as “yes” in the presence of at least one respiratory support event 
+#'  and “no” in its absence during a corresponding admission. 
+#'  
+#'  The following rules will be applied: 
+#'  
+#'  *From clinical diagnosis records:  
+#'  A clinical diagnosis event will be assessed using the period defined by
+#'   the variables ‘clinical_diagnosis_age_days_firstDate’ and 
+#'   ‘clinical_diagnosis_age_days_lastDate’. The event will be considered 
+#'   to have occurred during the admission period if the clinical diagnosis
+#'    period coincides with at least one day within the hospital admission. 
+#'  
+#'  *From therapeutic procedures records:  
+#'  If the variable procedure_age_days_date is available, the procedure 
+#'  will be considered to have occurred if the procedure date falls within the
+#'   hospital admission period. 
+#'  If the variable procedure_age_days_date is missing, the procedure will be 
+#'  considered to have occurred if its duration, defined by 
+#'  procedure_age_days_firstDate (start of the procedure) and 
+#'  procedure_age_days_lastDate (end of the procedure), 
+#'  coincides with at least one day of the hospital admission period. 
+#'  
+#'  Therapeutic procedures recorded on the same date as a clinical diagnosis 
+#'  will be excluded. The remaining therapeutic procedures and clinical diagnosis
+#'   records will then be evaluated to identify respiratory support events. 
+#'   This will be based on the ‘procedure’ and ‘clinical_diagnosis’ variables
+#'    by searching for the terms: “ventil” (excluding “acute hypoventilation”),
+#'     “oxygen”, “tracheostomy” or “tracheotomy”
+
+#### 1. identify therapeutic procedures during admissions
+therapeutic_rec <- hospital_admission_rec %>%
+  # join therapeutic procedures with hospital admissions
+  left_join(
+    rare_disease_therapeutic_procedures,
+    relationship = "many-to-many",
+    by = "patient_uuid"
+  ) %>%
+  # compute overlap flags (either a date or an interval)
+  mutate(
+    procedure_overlap = if_else(
+      !is.na(procedure_age_days_firstDate) &
+      !is.na(procedure_age_days_lastDate) &
+      !is.na(admission_age_days_firstDate) &
+      !is.na(admission_age_days_lastDate) &
+      (admission_age_days_firstDate <= procedure_age_days_lastDate) &
+      (admission_age_days_lastDate >= procedure_age_days_firstDate),
+      TRUE, FALSE
+    ),
+    # keep procedure name only if overlap
+    procedure = if_else(procedure_overlap, procedure, NA_character_)
+  ) %>%
+  # group by admission
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # summarise overlapping procedures (or NA if none)
+  summarise(
+    ther_procedure_name = str_c(
+      unique(na.omit(procedure)), collapse = "; "
+    ),
+    .groups = "drop"
+  ) %>%
+  # rename to procedure for binding rows with clinical diagnoses
+  rename(procedure = ther_procedure_name) %>%
+  arrange(
+    patient_uuid,
+    admission_age_days_firstDate)
+
+
+#### 2. idenfity clinical diagnoses during admissions
+#' Note: it was tested first the derivation of clinc. diag by episodes
+#' but there is no change in the final output as the affected records
+#' are not resp support. Thus it was kept the simplest derivation
+clinical_diagnosis_rec <- hospital_admission_rec %>%
+  # Joining clinical diagnosis with hospital admission by patient UUID
+  left_join(
+    rare_disease_clinical_diagnosis,
+    relationship = "many-to-many",
+    by = "patient_uuid"
+  ) %>%
+  mutate(
+    #' Boolean to determine if the clinical diagnosis (procedure) has an
+    #' explicit period that matches the admission period in at least one day
+    procedure_overlap = if_else(
+      !is.na(clinical_diagnosis_age_days_firstDate) &
+        !is.na(clinical_diagnosis_age_days_lastDate) &
+        !is.na(admission_age_days_firstDate) &
+        !is.na(admission_age_days_lastDate) &
+        (admission_age_days_firstDate <= clinical_diagnosis_age_days_lastDate) &
+        (admission_age_days_lastDate >= clinical_diagnosis_age_days_firstDate),
+      TRUE, FALSE
+    ),
+      clinical_diagnosis = if_else(
+         procedure_overlap, clinical_diagnosis, NA_character_
+    )
+  ) %>%
+  #' Filter to retain procedures at hospital admissions:
+  #' either a single-day procedure falls within admission period
+  #' or the procedure period overlaps with the admission period
+  #filter(procedure_overlap) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # Concatenate distinct values into a single cell as temporary variable
+  summarise(
+    clinical_diagnosis = str_c(
+      unique(na.omit(clinical_diagnosis)), collapse = "; "
+    ),
+    .groups = "drop"
+  ) %>%
+  # rename to procedure for binding rows with therapeutic procedures
+  rename(procedure = clinical_diagnosis) %>%
+  arrange(patient_uuid, admission_age_days_firstDate)
+
+#### 3. identify resp.support during admissions
+# Define respiratory support terms defined in SAP
+RESP_SUPPORT_TERMS <- c("ventil", "oxygen", "tracheostomy", "tracheotomy")
+
+resp_ther_proc_rec <- rbind(
+    # bind therapeutic procedures and clinical diagnoses
+    clinical_diagnosis_rec,
+    therapeutic_rec
+  ) %>%
+  # add a flag if procedure matches respiratory support terms
+  mutate(
+    respiratory_support_flag= case_when(
+      str_detect(
+        procedure,
+        regex(str_c(RESP_SUPPORT_TERMS, collapse = "|"), ignore_case = TRUE)
+      ) &
+      # exclude hypo ventilation term from the list after agreement with PE
+      !str_detect(
+        procedure,
+        regex("hypoventilation", ignore_case = TRUE)
+      ) ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  # group by admission
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # summaries as binary factor: "1" if any respiratory support, else "0"
+  summarise(
+   respiratory_support_admission = factor(
+      any(respiratory_support_flag, na.rm = TRUE) * 1,
+       levels = c(0, 1)
+    ),
+  .groups = "drop"
+  ) %>%
+  arrange(patient_uuid, admission_age_days_firstDate)
+```
+
+## Neonatal onset derivation
+
+```{r}
+#| label: Age at disease onset - first seizure record
+#| results: false
+#| warning: false
+#| message: false
+
+#' Definition:
+#' Derived as categorical variable to classify the number of patients whose
+#'  disease onset was recorded across in the following time ranges: 
+#'  0 to ≤ 28 days of life (i.e., neonatal onset) 
+#'  and >  28 days of life (i.e., non-neonatal onset)
+
+neonatal_onset_rec <- rare_disease_seizure_history %>% 
+  group_by(patient_uuid) %>% 
+  # # get the first seizure record for each patient
+  slice_min(
+    seizure_history_age_days
+  ) %>%
+  # remove duplicates based on patient UUID
+  distinct(patient_uuid, .keep_all = TRUE) %>%
+  ungroup() %>% 
+  mutate(
+    # continuous variable in days as temporary variable
+    age_disease_onset_days = seizure_history_age_days,
+    #' 28 days (including 28) as described by CDC and agreed with Pharm.epi
+    #' binary variable, being 1 if neonatal, otherwise 0.
+    neonatal_onset = factor((age_disease_onset_days <= 28) * 1)
+  ) %>%
+  dplyr::select(
+    patient_uuid,
+    age_disease_onset_days,
+    neonatal_onset
+  )
+```
+
+## Number of prescribed ASM at hospital admission derivation
+
+```{r}
+#| label: Antiseizure medications during hospitalizations
+#| results: false
+#| warning: false
+#| message: false
+
+#' Definition: 
+#' The number of ASM received at hospital admission will be computed from the
+#'  “Medication” and “Hospital admission" datasets. It will be derived as a
+#'   quantitative variable and defined for each hospital admission record, as 
+#'   the number of distinct ASMs received (variable “medication”) at the day of
+#'   hospital admission (variable "admission_age_days firstDate"). 
+#'   
+#'  ASM records with a continuous start and end date for the same drug will
+#'   be grouped into episodes. An episode ended if a gap of two or more day
+#'    s between records was detected. ASMs will be identified from the list 
+#'    obtained from: A Summary of Antiseizure Medications Available in
+#'     the United States - 4th Edition (2024)
+
+# 1. create list of antiseizure medications
+medication_asm_df <- rare_disease_medication %>%
+  filter(medication %in% c(
+    "Adrenocorticotropin (ACTH 1-18),I-125 (TYR)",
+    "Brivaracetam",
+    "Carbamazepine",
+    "Cenobamate",
+    "Clobazam",
+    "Clonazepam",
+    "Diazepam",
+    "Divalproex",
+    "Eslicarbazepine acetate",
+    "Ethosuximide",
+    "Epidiolex", # cannabidiol (CBD)
+    "Everolimus",
+    "Felbamate",
+    "Fenfluramine",
+    "Fosphenytoin",
+    "Gabapentin",
+    "Ganaloxone",
+    "Lacosamide",
+    "Lamotrigine",
+    "Levetiracetam",
+    "Lorazepam",
+    "Midazolam",
+    "Oxcarbazepine",
+    "Perampanel",
+    "Phenobarbital",
+    "Phenytoin",
+    "Pregabalin",
+    "Primidone",
+    "Rufinamide",
+    "Stiripentol",
+    "Tiagabine",
+    "Topiramate",
+    "Valproate", # Valproic acid
+    "Vigabatrin",
+    "Zonisamide"
+  )) %>%
+  # select variables of interest
+  dplyr::select(
+    patient_uuid,
+    medication,
+    medication_age_days_firstDate,
+    medication_age_days_lastDate
+  ) %>%
+  # remove duplicate rows (not taking dose into account)
+  distinct() %>%
+  group_by(
+    patient_uuid, 
+    medication
+    ) %>%
+  arrange(
+    medication_age_days_firstDate,
+    desc(medication_age_days_lastDate)
+  )
+
+#' 2 Identify episodes to identify the longest administration windows and 
+#' remove the nested ones
+medication_asm_df_episodes <- medication_asm_df %>%
+  mutate(
+    ##' find the largest end date from current row to row 1
+    ##' for each pat/medic combination
+    max_end = purrr::accumulate(medication_age_days_lastDate, max),
+    
+    ## difference between current start and the end of the previous row
+    date_diff = medication_age_days_firstDate - lag(max_end, default = T),
+    
+    ##' if date_diff is >=2 (i.e., episod starts more than 1 day after
+    ##'  the end of the previous), episod is incremented by 1
+    episod = purrr::accumulate(date_diff >= 2, sum, na.rm = TRUE)
+  ) %>%
+  # Group by to identify distinct administration windows
+  group_by(
+    patient_uuid, 
+    medication,
+    episod
+    ) %>%
+  arrange(
+    patient_uuid, 
+    medication, 
+    medication_age_days_firstDate
+    ) %>%
+  # summarise with the first and last date of administration for each drug
+  summarise(
+    medication_age_days_firstDate = min(medication_age_days_firstDate),
+    medication_age_days_lastDate = max(medication_age_days_lastDate),
+    .groups = "drop"
+  )
+
+# 3. Join the processed ASM dataframe with admission records
+asm_at_admission_rec <- hospital_admission_rec %>%
+  left_join(
+    medication_asm_df_episodes,
+    by = "patient_uuid",
+    relationship = "many-to-many"
+  ) %>%
+  # Create flag for ASM overlap only at the day of the admission start 
+  mutate(
+    medication_overlap = 
+      !is.na(medication_age_days_firstDate) &
+      !is.na(medication_age_days_lastDate) &
+      admission_age_days_firstDate >= medication_age_days_firstDate &
+      admission_age_days_firstDate <= medication_age_days_lastDate
+  ) %>%
+  # Only keep medications that were present at day of admission, if not, NA
+  mutate(
+    medication = if_else(medication_overlap, medication, NA_character_)
+  ) %>%
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate, 
+    admission_age_days_lastDate
+    ) %>%
+  summarise(
+    # main variable to count distinct medications at day of admission
+    n_distinct_asm_admission = n_distinct(medication, na.rm = TRUE),
+    # temporary variable to check medications
+    medication_name = str_c(unique(na.omit(medication)), collapse = "; "),
+    # categorical variable created for potential add-hoc analyses
+    current_asm_at_admission = factor(
+      case_when(
+        n_distinct_asm_admission == 0 ~ "0",
+        n_distinct_asm_admission == 1 ~ "1",
+        n_distinct_asm_admission == 2 ~ "2",
+        n_distinct_asm_admission >= 3 ~ ">=3",
+      ),
+      levels = c("0", "1", "2", ">=3"),
+    ),
+    .groups = "drop"
+  )
+
+#' Calculate number of distinct ASM before first admission for SR analysis 
+#' at first hospital admission
+# count number of distinct ASM received before first admission
+asm_before_first_admission <- hospital_admission_rec %>%
+  arrange(patient_uuid, admission_age_days_firstDate) %>%
+  # ensure to remove birth, planned and outpatient admissions
+  filter(
+    birth_admission == 0,
+    planned_admission == 0,
+    outpatient_admission == 0
+  ) %>%
+  group_by(patient_uuid) %>%
+  # keep only first admission per patient
+  slice_head(n = 1) %>% 
+  ungroup() %>%
+  # join with medication episodes
+  left_join(
+    medication_asm_df_episodes,
+    by = "patient_uuid",
+    relationship = "many-to-many"
+  ) %>%
+  # join first record age days to define pre-admission period
+  left_join(
+    rare_disease_followup_durations_days %>% dplyr::select(
+      patient_uuid,
+      first_record_age_days
+    ),
+    by = "patient_uuid",
+    relationship = "many-to-many"
+  ) %>%
+  distinct() %>%
+  mutate(
+    pre_admission_end = admission_age_days_firstDate - 1,
+    overlap_before_first_admission =
+      !is.na(first_record_age_days) &
+      !is.na(pre_admission_end) &
+      !is.na(medication_age_days_firstDate) &
+      !is.na(medication_age_days_lastDate) &
+      medication_age_days_lastDate >= first_record_age_days &
+      medication_age_days_firstDate <= pre_admission_end,
+    medication_before_first_admission = if_else(overlap_before_first_admission, medication, NA_character_)
+  ) %>%
+    group_by(
+    patient_uuid,
+    admission_age_days_firstDate, 
+    admission_age_days_lastDate
+    ) %>%
+  summarise(
+    n_distinct_asm_start_fu = n_distinct(medication_before_first_admission, na.rm = TRUE),
+    meds_before_first_admission = str_c(sort(unique(na.omit(medication_before_first_admission))), collapse = "; "),
+    .groups = "drop"
+  )
+```
+
+## Quinidine treatment derivation
+
+```{r}
+#| label: Quinidine use during hospitalizations
+#| results: false
+#| warning: false
+#| message: false
+
+#' Definition:
+#' Quinidine treatment effective during hospital admission 
+#' The use of quinidine during hospital admissions will be computed from the
+#'  “Medication” and Hospital admission” datasets. It will be derived as a 
+#'  binary variable for each hospital admission record, defined as “yes” if
+#'   the period quinidine medication (defined by the (variables
+#'    ‘medication_age_days_firstDate’ and ‘medication_age_days_lastDate’) 
+#'    coincides with at least one day of the hospital admission period 
+#'    ,and “no” otherwise.  
+#'
+#' Quinidine records with a continuous start and end date were grouped into
+#'  episodes. An episode ended if a gap of two or more days between records 
+#'  was detected. ‘medication_age_days_firstDate’‘medication_age_days_firstDate’
+
+QUINIDINE <- c("Quinidine", "quinidine")
+
+#1. detecting and merging episodes of quinidine use
+quinidine_use_episodes <- rare_disease_medication %>%
+  # filter quinidine administration only
+  filter(medication %in% QUINIDINE) %>%
+  dplyr::select(
+    patient_uuid,
+    medication,
+    medication_age_days_firstDate,
+    medication_age_days_lastDate
+  ) %>%
+  ## remove duplicate rows (not taking dose into account for this analysis)
+  distinct() %>%
+  group_by(patient_uuid, medication) %>%
+  arrange(
+    medication_age_days_firstDate,
+    desc(medication_age_days_lastDate)
+  ) %>%
+  #' Identify episodes to identify the longest administration windows
+  #' and remove the nested ones
+  mutate(
+    ##' find the largest end date from current row to row 1
+    ##' for each pat/medic combination
+    max_end = purrr::accumulate(medication_age_days_lastDate, max),
+    
+    ## difference between current start and the end of the previous row
+    date_diff = medication_age_days_firstDate - lag(max_end, default = T),
+    
+    ##' keep all records, just merged continuous (without gap) one 
+    ##' and remove nested 
+    episod = purrr::accumulate(date_diff > 0, sum, na.rm = TRUE)
+  ) %>%
+  # Identify distinct prescription windows (no effective windows)
+  arrange(patient_uuid, episod, medication_age_days_firstDate) %>%
+  # Group by patient and episode
+  group_by(patient_uuid, episod) %>%
+  summarise(
+    medication_age_days_firstDate = min(medication_age_days_firstDate),
+    medication_age_days_lastDate = max(medication_age_days_lastDate),
+    .groups = "drop"
+  ) %>%
+  ungroup()
+
+#2.  identify admissions with matching use of quinidine in at least one day
+quinidine_during_admission_rec_any <- hospital_admission_rec %>%
+  # Join hospital admissions and quinidine episodes on patient_uuid and overlap of periods
+  left_join(
+    quinidine_use_episodes,
+    join_by(
+      patient_uuid,
+      overlaps(
+        admission_age_days_firstDate,
+        admission_age_days_lastDate,
+        medication_age_days_firstDate,
+        medication_age_days_lastDate
+      )
+    )
+  ) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' Summarise a binary variable indicating quinidine use for each hospital 
+  #' admission record (at least one day of match)
+  summarise(
+    # if there is a match between the quinidine use and the admission
+    # period, then it is an 1, otherwise 0
+    quinidine_admission = factor(any(!is.na(medication_age_days_firstDate)) * 1),
+    .groups = "drop"
+  )
+
+#2.a identify admissions with quinidine already active on the admission day
+quinidine_during_admission_rec_on_day <- hospital_admission_rec %>%
+  # Join hospital admissions and quinidine episodes where admission start is within the quinidine use period
+  left_join(
+    quinidine_use_episodes,
+    join_by(
+      patient_uuid,
+      between(
+        admission_age_days_firstDate,
+        medication_age_days_firstDate,
+        medication_age_days_lastDate
+      )
+    )
+  ) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' Summarise a binary variable indicating quinidine use at the admission day
+  summarise(
+    quinidine_at_admission_day = factor(any(!is.na(medication_age_days_firstDate)) * 1),
+    .groups = "drop"
+  )
+
+#2.b merge both variables into the final df (keep original name)
+quinidine_during_admission_rec <- quinidine_during_admission_rec_any %>%
+  left_join(
+    quinidine_during_admission_rec_on_day,
+    by = c(
+      "patient_uuid",
+      "admission_age_days_firstDate",
+      "admission_age_days_lastDate"
+    )
+  )
+```
+
+## Adverse effects during admission derivation
+
+```{r}
+#| label: Adverse effects during admissions
+#| results: false
+#| warning: false
+#| message: false
+
+#' Definition:
+#' The presence of adverse effects for each hospital admission record will be
+#'  computed from the “Adverse effects” and “Hospital admission” datasets. It
+#'   will be derived for each hospital admission record as a binary variable 
+#'   defined as “yes” in the presence of at least one adverse effect of any type
+#'    (variable ‘adverse_effect’) and “no” otherwise.  
+#'    An adverse effect event will be considered to have occurred if its 
+#'    duration, defined by adverse_effect_age_days_firstDate (i.e., start 
+#'    of the adverse effect) and adverse_effect_age_days_lastDate (i.e., end of
+#'     the adverse effect), coincides with at least one day of the hospital 
+#'     admission period 
+#'     Note: the variable is called adverse effects and not adverse events**
+adverse_effect_during_admission_rec <- hospital_admission_rec %>%
+  # Join adverse event episodes
+  left_join(
+    rare_disease_adverse_effects,
+    by = "patient_uuid",
+    relationship = "many-to-many"
+  ) %>%
+  distinct(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    adverse_effect,
+    medication_procedure,
+    adverse_effect_age_days_firstDate,
+    adverse_effect_age_days_lastDate
+  ) %>%
+  # Boolean overlap: adverse event overlaps with admission
+  mutate(
+    adverse_effect_overlap = if_else(
+      !is.na(adverse_effect_age_days_firstDate) &
+        !is.na(adverse_effect_age_days_lastDate) &
+        !is.na(admission_age_days_firstDate) &
+        !is.na(admission_age_days_lastDate) &
+        (adverse_effect_age_days_firstDate <= admission_age_days_lastDate) &
+        (adverse_effect_age_days_lastDate >= admission_age_days_firstDate),
+      TRUE, FALSE
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # Add binary variable (0/1) for adverse event presence during admission
+  # Note: for those admissions without AE, it was assumed no event (i.e., 0)
+  summarise(
+    # below some temporary variables to check AE types & medications
+    number_of_adverse_effects = sum(adverse_effect_overlap, na.rm = TRUE),
+    adverse_effect_types = if_else(any(adverse_effect_overlap, na.rm = TRUE),
+      paste(sort(unique(adverse_effect[adverse_effect_overlap])), 
+            collapse = "; "),
+      NA_character_
+    ),
+    medication_procedure = if_else(any(adverse_effect_overlap, na.rm = TRUE),
+      paste(sort(unique(medication_procedure[adverse_effect_overlap])), 
+            collapse = "; "),
+      NA_character_
+    ),
+    # create the binary variable if at least one AE for each admission
+    adverse_effect_admission = factor(
+      # if there is a match between the adverse event and the admission
+      # period, then it is an 1, otherwise 0
+      any(adverse_effect_overlap, na.rm = TRUE) * 1),
+    .groups = "drop"
+  )
+```
+
+## Mutated genes derivation
+
+```{r}
+#| label: rare_disease mutated genes
+#| results: false
+#| warning: false
+#| message: false
+
+# list of mutated genes taken from gene4epilepsy
+LIST_MUTATED_GENES <- gene4epilepsy_list_202503$Gene
+
+# clean duplicates
+mutations <- rare_disease_genetic_findings %>% 
+  dplyr::select(
+    patient_uuid,
+    gene,
+    variant_DNA,
+    variant_protein,
+    interpretation,
+    inheritance
+    ) %>% 
+  group_by(
+    patient_uuid,
+    gene, 
+    variant_DNA,
+    variant_protein
+    ) %>% 
+  mutate(
+    interpretation_corr = paste0(interpretation, collapse = ", "), 
+    inheritance_corr = paste0(inheritance, collapse = ", ")
+  ) %>% 
+  # there is a patient with two mutations in rare_disease gen (51 unique)
+  distinct(
+    patient_uuid,
+    gene,
+    variant_DNA,
+    variant_protein,
+    .keep_all = TRUE)
+
+# Step 2 — count rare_disease + epilepsy-related genes
+mutations_epilepsy_rec <- mutations %>%
+  ungroup() %>%
+  group_by(patient_uuid) %>%
+  # count mutations in rare_disease and epilepsy-related genes
+  summarise(
+    rare_disease = any(gene == "rare_disease"),
+    n_mutations_epilepsy = n_distinct(
+      gene[gene != "rare_disease" & gene %in% LIST_MUTATED_GENES]),
+    .groups = "drop"
+  ) %>% 
+  # only patients with rare_disease
+  filter(rare_disease) %>%
+  # define binary variable
+  mutate(
+    # when there rare_disease and another/other genes assign an 1, otherwise 0
+    other_epilepsy_mutations = factor((n_mutations_epilepsy > 0) * 1)
+  ) %>%
+  dplyr::select(patient_uuid, other_epilepsy_mutations)
+```
+
+## Highly recurrent variants derivation
+
+```{r}
+#| label: rare_disease highly recurrent variants
+#| results: false
+#| warning: false
+#| message: false
+
+# List of recurrent variants which are present in >= 10% of RWD patients
+# The variants were confirmed with Borlot et al (2020)
+variant_DNA_summary <- mutations %>%
+  group_by(variant_DNA) %>%
+  summarise(
+    # variants per patient
+    n_patients = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # proportion from total patients 
+    proportion = round(
+      n_patients / sum(n_distinct(mutations$patient_uuid)) * 100, 2)
+  ) %>%
+  arrange(desc(n_patients))
+
+# List of recurrent variants in >= 10% of patients
+RECURRENT_VARIANTS <- variant_DNA_summary %>%
+  filter(proportion >= 10) %>%
+  pull(variant_DNA)
+
+#' Classify patients by presence of at least one recurrent variant using
+#'  curated mutation_rec df
+recurrent_variant_rec <- mutations %>%
+  group_by(patient_uuid) %>%
+  summarise(
+    # assing an 1 if at least one recurrent variant, otherwise 0
+    recurrent_variant = factor(any(variant_DNA %in% RECURRENT_VARIANTS) * 1),
+    .groups = "drop"
+  ) %>%
+  dplyr::select(patient_uuid, recurrent_variant)
+```
+
+# Main analyses dataframes
+
+## Dataframe for secondary endpoints
+
+```{r}
+#| label: Joining patient level dataframes
+#| results: false
+
+# List of dataframes to join by patient_uuid
+patient_level_dfs <- list(
+  hospital_admission_rec, # start, end day, seizure diagnosis type & lohs vars.
+  followup_rec, # first and last day follow up variables
+  demographics_rec, # sex variable
+  neonatal_onset_rec, # neonatal onset variable
+  mutations_epilepsy_rec, # other epilepsy mutations variable
+  recurrent_variant_rec # recurrent variant status variable
+)
+
+# merge patient-level dataframes by patient_uuid
+hospital_joined_df <- purrr::reduce(
+  patient_level_dfs,
+  left_join, 
+  by = "patient_uuid")
+```
+
+```{r}
+#| label: Joining admission-varying dataframes
+#| results: false
+
+admission_join_var <- c(
+  "patient_uuid",
+  "admission_age_days_firstDate",
+  "admission_age_days_lastDate"
+)
+
+# List of time-varying covariates to join
+time_varying_dfs <- list(
+  hospital_readmission_rec, # readmission type variable
+  hospital_readmission_counts_rec, # count uhrs and exptime variables
+  resp_ther_proc_rec, # respiratory support variable
+  first_tech_assistance_proc_rec, # tech assistance variable
+  first_vns_insertion_proc_rec, # vns insertion variable
+  asm_at_admission_rec, # n_distinct asm variable
+  asm_before_first_admission, # n_distinct asm at start of follow-up variable for sr admission at first admission
+  adverse_effect_during_admission_rec, # adverse events admission variable
+  ketogenic_during_admission_rec, # ketogenic diet admission variable
+  quinidine_during_admission_rec # quinidine use admission variable
+)
+
+# joining hosptialization-varying covariates
+hospital_joined_df <- purrr::reduce(
+  time_varying_dfs,
+  left_join,
+  .init = hospital_joined_df,
+  by = admission_join_var
+)
+```
+
+```{r}
+#| label: Final processing of the hospital admission joined main analyses df
+#| results: false
+
+# Final processing of the joined dataframe for main analyses
+# Note: dataframe that will be used for all secondary endpoint main analyses
+hospitalization_main_df <- hospital_joined_df %>%
+  mutate(
+    patient_uuid = as.factor(patient_uuid)
+  ) %>%
+  # select and order variables of interest in joined df
+  dplyr::select(
+    # patient identifier
+    patient_uuid,
+    # admissions related features
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    birth_admission,
+    planned_admission,
+    outpatient_admission,
+    # demographics
+    sex,
+    age_admission_yr,
+    # follow up and disease onset
+    first_record_age_days,
+    last_record_age_days,
+    neonatal_onset,
+    # genetic mutations
+    other_epilepsy_mutations,
+    recurrent_variant,
+    # clinical history
+    admission_diagnosis,
+    seizure_related_admission,
+    length_of_stay_days,
+    length_of_stay_days_cat,
+    respiratory_support_admission,
+    tech_assistance_ever,
+    readmission,
+    count_readmissions,
+    exptime,
+    # treatment history
+    vns_insertion_ever,
+    n_distinct_asm_admission,
+    n_distinct_asm_start_fu, # last variable added for SR at first admission
+    adverse_effect_admission,
+    ketogenic_diet_admission,
+    ketogenic_diet_at_admission_day, # added for sr analysis
+    quinidine_admission,
+    quinidine_at_admission_day # added for sr analysis
+  ) %>%
+  # arrange by patient uuid and admission day
+  arrange(patient_uuid, admission_age_days_firstDate)
+```
+
+```{r}
+#| label: save-main-df-file-GCS
+#| results: false
+#| warning: false
+#| message: false
+
+# create temp dir to save file
+dir.create("~/RWE-rare_disease/Hospitalizations/output/data")
+
+# save df as rds file
+saveRDS(hospitalization_main_df, "data/hospitalization_main_df.rds")
+
+# Upload final df to GCS
+gcs_upload("~/RWE-rare_disease/Hospitalizations/output/data/hospitalization_main_df.rds",
+  bucket = "YOUR_GCS_BUCKET",
+  name = "MSM_Hospitalizations/hospitalization_main_df.rds"
+)
+```
+
+## Dataframe for exploratory endpoint
+
+```{r}
+#| label: patient-trajectory-derivation-df
+#| echo: false
+#| results: false
+#| warning: false
+
+# Patient trajectory across hospitalization states #
+#' The patient trajectory describes the patient’s health status over time during
+#'  follow-up, showing whether they are out of hospital, admitted with a
+#'  seizure-related diagnosis, or admitted for another reason at any given
+#'  time of follow-up until death or lost to follow-up. It will be defined
+#'  as a time-dependent categorical variable that classify each patient into
+#'   one of three different states:
+#'
+# 1. Out-of-hospital state.
+# 2. Seizure-related admission state == SR state
+# 3. Non-seizure-related admission state == non SR state
+
+
+# 1). Define the hospitalization states from initial df (SR and non SR only)
+#' Note 1: to start it will be used the curated hospital_admission_rec derived
+#'  for all secondary endpoints.
+#' Note: 2 in this analysis, all admissions, including birth, planned and
+#'  outpatient admissions will be used to capture the full trajectory of patients
+#'  Note 3: the time-scale is based on patient's age at admission
+#'  start/discharge in days, and then renamed to tstart and tstop.
+admissions_initial_states <- hospital_admission_rec %>%
+  # bring first and last record to
+  left_join(rare_disease_followup_durations_days, by = "patient_uuid") %>%
+  mutate(
+    state = if_else(seizure_related_admission == 1,
+      "SR admission",
+      "Non-SR admission"
+    ),
+    # use patient age in days as main timescale
+    age_state_start = admission_age_days_firstDate,
+    age_state_end = admission_age_days_lastDate,
+    # duration of each state in days without including the end day
+    duration_state = age_state_end - age_state_start
+  ) %>%
+  dplyr::select(
+    patient_uuid,
+    state,
+    age_state_start,
+    age_state_end,
+    duration_state,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    followup_duration,
+    first_record_age_days,
+    last_record_age_days
+  )
+
+
+# 2). Merge consecutive admissions of same type into single states
+# 2.1 flag next day admissions for same type of states into episodes
+#' gap_threshold = 1 → next hospitalization record starts on the next day (+1)
+#'  after the previous discharge (for the same patient and with the same type
+#'   of sr diagnosis)
+#'  Note: there are  9 transitions from SR to SR and 7 non-SR to non-SR in raw data.
+admissions_initial_states_flagged <- flag_admission_episodes(
+  admissions_initial_states,
+  gap_threshold = 1 # next day
+)
+
+# 2.2 merge flagged episodes into single states to remove transitions between same states
+admissions_initial_states_merged <- admissions_initial_states_flagged %>%
+  group_by(
+    patient_uuid, # by patient
+    episode_id, # by episode identified earlier
+    state # and by seizure-related or non-seizure-related state
+  ) %>%
+  summarise(
+    age_state_start = min(age_state_start),
+    age_state_end = max(age_state_end),
+    duration_state = age_state_end - age_state_start,
+    followup_duration = first(followup_duration),
+    first_record_age_days = first(first_record_age_days),
+    last_record_age_days = first(last_record_age_days),
+    .groups = "drop"
+  ) %>%
+  dplyr::select(-episode_id)
+
+# 3) Derive out of hospital (OOH) state
+# 3.1. Derive out of hospital (OOH) gaps between admissions
+admissions_states_out_hospital <- admissions_initial_states_merged %>%
+  arrange(patient_uuid, age_state_start) %>%
+  group_by(patient_uuid) %>%
+  mutate(
+    prev_end = lag(age_state_end),
+    next_start = lead(age_state_start),
+    # OOH starts at the day after previous discharge or first record age days
+    ooh_start = case_when(
+      is.na(prev_end) & age_state_start > first_record_age_days ~ first_record_age_days,
+      prev_end < age_state_start - 1 ~ prev_end
+    ),
+    # OOH ends the same day of the next admission start day
+    ooh_end = case_when(
+      is.na(prev_end) & age_state_start > first_record_age_days ~ age_state_start,
+      prev_end < age_state_start - 1 ~ age_state_start,
+      is.na(next_start) ~ NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  # remove invalid OOH intervals
+  filter(!is.na(ooh_start), ooh_end >= ooh_start) %>%
+  transmute(
+    patient_uuid,
+    state = "Out-of-hospital",
+    age_state_start = ooh_start, # age in days
+    age_state_end = ooh_end, # age in days
+    duration_state = ooh_end - ooh_start,
+    followup_duration,
+    first_record_age_days,
+    last_record_age_days
+  )
+
+# 3.2. Derive OOH state for patients under follow-up but NO admissions
+admissions_states_out_hospital_none <- rare_disease_followup_durations_days %>%
+  dplyr::anti_join(
+    admissions_states_out_hospital %>% dplyr::distinct(patient_uuid),
+    by = "patient_uuid"
+  ) %>%
+  transmute(
+    patient_uuid,
+    state = "Out-of-hospital",
+    # OOH starts at first record age days
+    age_state_start = first_record_age_days,
+    # OOH ends at last record age days
+    age_state_end = last_record_age_days,
+    duration_state = age_state_end - age_state_start,
+    followup_duration,
+    first_record_age_days,
+    last_record_age_days
+  )
+
+# 4) Merge admissions (sr and non-sr) with out-of-hospital states
+all_states_full <- bind_rows(
+  admissions_initial_states_merged,
+  admissions_states_out_hospital,
+  admissions_states_out_hospital_none
+) %>%
+  arrange(patient_uuid, age_state_start) %>%
+  dplyr::select(-c(
+    followup_duration,
+    first_record_age_days
+  ))
+
+#' 5) Extend last state until the last medical record (if needed, as 4 patients
+#' had the last medical record with a discharge day for a hospitalization)
+all_states_full_fu <- all_states_full %>%
+  group_by(patient_uuid) %>%
+  arrange(age_state_end, age_state_start, .by_group = TRUE) %>% # sort within patient
+  slice_tail(n = 1) %>% # keep last row per patient
+  ungroup() %>%
+  # extend only if observation ends after the last state
+  filter(last_record_age_days > age_state_end) %>%
+  group_by(patient_uuid) %>%
+  mutate(
+    out_hospital_start = age_state_end,
+    out_hospital_end   = last_record_age_days
+  ) %>%
+  transmute(
+    patient_uuid,
+    state = "Out-of-hospital",
+    age_state_start = out_hospital_start, # age in days
+    age_state_end = out_hospital_end, # age in days
+    duration_state = age_state_end - age_state_start
+  )
+
+# 6) Final merge of all states including observations until last medical record.
+all_states_full_fu_joined <- bind_rows(all_states_full, all_states_full_fu) %>%
+  arrange(patient_uuid, age_state_start) %>%
+  dplyr::select(-last_record_age_days)
+```
+
+```{r}
+#| label: msm-ag-model-covariates
+#| echo: true
+#| warning: false
+#| results: false
+
+# Add covariates to the one row per transition dataframe
+# Preparing dataframe for MSM AG model with covariates
+#' this process is similar to the one proposed by expand.covs from mstate package
+#' for creating transition specific covariates
+#'  https://cran.r-project.org/web/packages/mstate/vignettes/Tutorial.pdf
+
+# 1) Add fixed time covariates 
+# 1.1. Sex variable, as sex male = 1
+msm_ag_model_sex <- all_states_full_fu_joined %>%
+  left_join(
+    # df defined for main analysis
+    demographics_rec %>% distinct(patient_uuid, .keep_all = TRUE) %>%
+      dplyr::select(
+        patient_uuid,
+        sex),
+    by = "patient_uuid"
+  ) %>%
+  group_by(
+    patient_uuid
+  ) %>%
+  mutate(
+    sex_male = as.numeric(sex == "male")
+  ) %>%
+  dplyr::select(-sex)
+
+
+# 1.2. add neonatal onset status, as neonatal onset yes = 1
+msm_ag_model_neo_onset <- all_states_full_fu_joined %>%
+  left_join(
+    # df defined for main analysis
+    neonatal_onset_rec %>% distinct(patient_uuid, .keep_all = TRUE) %>%
+      dplyr::select(
+        patient_uuid,
+        neonatal_onset),
+    by = "patient_uuid"
+  ) %>%
+  group_by(
+    patient_uuid
+  ) %>%
+  mutate(
+    neonatal_onset_yes = as.numeric(neonatal_onset == 1)
+  ) %>%
+  dplyr::select(-neonatal_onset, -state, -duration_state)
+
+# 2) Add time-varying covariates
+# 2.1 join quinidine treatment active on the transition day
+msm_ag_model_quinidine <- all_states_full_fu_joined %>%
+  #' Join derived df and quinidine episodes where the transition 
+  #' start is within the quinidine use period
+  left_join(
+    # df defined for main analysis
+    quinidine_use_episodes,
+    join_by(
+      patient_uuid,
+      between(
+        age_state_start,
+        medication_age_days_firstDate,
+        medication_age_days_lastDate
+      )
+    )
+  ) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    age_state_start,
+    age_state_end
+  ) %>%
+  #' Summarise as binary numerical variable indicating quinidine treatment
+  #'  at transition day
+  summarise(
+    quinidine_at_transition_day = 
+      as.numeric(any(!is.na(medication_age_days_firstDate)) * 1),
+      .groups = "drop"
+  ) 
+
+# 2.2. join number of distinct ASMs at transition day
+msm_ag_model_asm <- all_states_full_fu_joined %>%
+  #' Join  derived df and asm episodes where the transition 
+  #' start is within the medication use period
+  left_join(
+    # df defined for main analysis
+    medication_asm_df_episodes,
+    join_by(
+      patient_uuid,
+      between(
+        age_state_start,
+        medication_age_days_firstDate,
+        medication_age_days_lastDate
+      )
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    age_state_start,
+    age_state_end
+  ) %>%
+  summarise(
+    #' count number of distinct ASM at transition day
+    n_distinct_asm_at_transition_day = n_distinct(medication, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# join ketogenic diet episodes to identify if under ketogenic diet at transition day
+msm_ag_model_keto <- all_states_full_fu_joined %>%
+  #' Join  derived df and ketogenic diet episodes where the transition 
+  #' start is within the ketogenic diet effective intervention period
+  left_join(
+    # df defined for main analysis
+    ketogenic_diet_episodes,
+    # Check for overlap between *effective* procedure window and admission
+    #' any part of the period starting from day 14 to the end of the
+    #' ketogenic treatment overlaps with the admission
+    join_by(
+      patient_uuid,
+      between(
+        age_state_start,
+        keto_effective_first_day,
+        keto_effective_last_day)
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    age_state_start,
+    age_state_end
+  ) %>%
+  #' Summarise a binary variable indicating was under ketogenic diet
+  #'  for each hospital admission record (if there is a match at the day of admission)
+  summarise(
+    #' if the admission day is within the effective period, yes = 1, otherwise 0
+    ketogenic_diet_at_transition_day = 
+      as.numeric(any(!is.na(keto_effective_first_day)) * 1),
+    .groups = "drop"
+  )
+
+# join VNS insertion ever before or on transition day
+msm_ag_model_vns <- all_states_full_fu_joined %>% 
+  #' Join derived df and vns insertion for each patient when where the transition 
+  #' start occurred after the first VNS insertion.
+  left_join(
+    # df defined for main analysis
+    first_vns_insertion_proc,
+    join_by(
+      patient_uuid,
+      age_state_start >= first_event_date    
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    age_state_start,
+    age_state_end
+  ) %>%
+  summarise(
+    #' create VNS binary variable Presence "1" or absence "0" if at or before
+    #'  the transition day, the patient had a VNS insertion
+    vns_at_transition_ever = as.numeric(any(!is.na(first_event_date))),
+    .groups = "drop"
+  )
+
+# match hospitalization records with first_tech_assistance dates
+msm_ag_model_tech_assistance <- all_states_full_fu_joined %>%
+  #' Join derived df and tech assistance first event for each patient where 
+  #' the transition start occurred after the first tech assistance
+  left_join(
+    # df defined for main analysis
+    first_tech_assistance_proc,
+    join_by(
+      patient_uuid,
+      age_state_start >= first_event_date    
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    age_state_start,
+    age_state_end
+  ) %>%
+  #' create tech assistance binary variable Presence "1" or absence "0"
+  #' indicating if before or at transition day, the patient had at least
+  #' 1 or more tech assistance procedures on or before the admission day.
+  summarise(
+    tech_assistance_at_transition_ever = 
+      as.numeric(any(!is.na(first_event_date))),
+    .groups = "drop")
+
+
+# variables to join by
+msm_join_var <- c(
+  "patient_uuid",
+  "age_state_start",
+  "age_state_end"
+)
+
+# List of time-varying covariates to join
+time_varying_msm_dfs <- list(
+  msm_ag_model_neo_onset,
+  msm_ag_model_quinidine,
+  msm_ag_model_asm,
+  msm_ag_model_keto,
+  msm_ag_model_vns,
+  msm_ag_model_tech_assistance
+)
+
+# joining hosptialization covariates for MSM AG model
+msm_ag_model_cov <- purrr::reduce(
+  time_varying_msm_dfs,
+  left_join,
+  .init = msm_ag_model_sex,
+  by = msm_join_var
+)
+```
+
+```{r}
+#| label: msm-ag-model-cov-long-format
+#| echo: true
+#| warning: false
+
+#' 1. Create the counting process long format dataframe based on:
+# https://www.sciencedirect.com/science/article/pii/S0169260703001329 Paes (2004)
+# http://link.springer.com/10.1007/978-1-4757-3294-8 Therneau and Grambsch (2000)
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2692556/ Meira Machado (2009)
+# https://onlinelibrary.wiley.com/doi/10.1002/sim.2712 Putter (2007)
+msm_ag_model_cov_long <- msm_ag_model_cov %>%
+arrange(patient_uuid, age_state_start) %>%
+  group_by(patient_uuid) %>%
+  mutate(
+    next_state = lead(state),
+    from_num = case_when(
+      state == "Out-of-hospital"   ~ 1L,
+      state == "SR admission"      ~ 2L,
+      state == "Non-SR admission"  ~ 3L
+    ),
+    to_num = case_when(
+      lead(state) == "Out-of-hospital"   ~ 1L,
+      lead(state) == "SR admission"      ~ 2L,
+      lead(state) == "Non-SR admission"  ~ 3L,
+      TRUE ~ NA_integer_
+    ),
+    tstart = age_state_start,
+    # check if last record per patient to avoid NA in tstop  +1
+    tstop  = age_state_end
+  ) %>%
+  ungroup()
+
+# 2. Specify allowed transitions and their numeric codes for inner join
+allowed <- tibble::tribble(
+  ~from, ~to, ~transition,
+  1L,    2L, 1,   # 1->2
+  1L,    3L, 2,   # 1->3
+  2L,    1L, 3,   # 2->1
+  3L,    1L, 4,   # 3->1
+  2L,    3L, 5,   # 2->3 
+  3L,    2L, 6    # 3->2 
+)
+
+# 3. Create final long format df for MSM AG model with covariates
+#' it will add an extra row per allowed transition per time interval to have
+#'  the time under risk for the other transitions
+msm_ag_model_cov_long_df <- msm_ag_model_cov_long %>%
+  inner_join(allowed, 
+             by = c("from_num" = "from"), 
+             relationship = "many-to-many"
+             ) %>%
+  mutate(
+    # event indicator for the transition of interest
+    # If the next state matches the 'to' state of the allowed transition, event = 1.
+    #' If not, and there is a next state, event = 0 (no transition occurred,
+    #'  right censored at end of follow-up).
+    event = as.numeric(!is.na(to_num) 
+                       & to_num == to),
+    # label the transitions and specify levels
+    transition = factor(transition, 
+                        levels = 1:6,
+                        labels = c("1-2","1-3","2-1","3-1","2-3","3-2"))
+  ) %>%
+  # order columns and arrange
+  dplyr::select(
+    patient_uuid, 
+    state,
+    transition, 
+    tstart, 
+    tstop,
+    event,
+    duration_state,
+    sex_male,
+    neonatal_onset_yes,
+    quinidine_at_transition_day,
+    n_distinct_asm_at_transition_day,
+    ketogenic_diet_at_transition_day,
+    vns_at_transition_ever,
+    tech_assistance_at_transition_ever
+  ) %>%
+  arrange(patient_uuid, tstart, transition)
+```
+
+```{r}
+#| label: msm-ag-modelling-data-export
+#| eval: false
+#| echo: false
+
+# Upload to SAS the ptransit dataframe with TWO states (in and out of hospital)
+dir.create("~/RWE-rare_disease/Hospitalizations/output/data")
+
+# save df as rds file
+saveRDS(msm_ag_model_cov_long_df, "data/msm_ag_model_cov_long_df.rds")
+
+# Upload final df to GCS
+gcs_upload("~/RWE-rare_disease/Hospitalizations/output/data/msm_ag_model_cov_long_df.rds",
+  bucket = "YOUR_GCS_BUCKET",
+  name = "MSM_Hospitalizations/msm_ag_model_cov_long_df.rds"
+)
+```
+
+# Sensitivity analyses dataframes
+
+### Merging hospitalization records when the admission day occurs on the same or next day as the prior discharge day
+
+```{r}
+#| label: no merged df 
+#| echo: false
+#| results: false
+
+hospitalizations_no_merged <- hospitalization_main_df %>%
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    seizure_related_admission,
+    planned_admission,
+    birth_admission,
+    outpatient_admission
+  )
+```
+
+#### Hospitalization occurs on the SAME day as the prior discharge day
+
+```{r}
+#| label: merging hospital admission records same day
+#| echo: false
+#| results: false
+
+#' gap_threshold = 0 → next hospitalization record starts on the *same day (+0)*
+#'  as the previous discharge (for the same patient and with the same type of
+#'  sr diagnosis)
+
+# 1. Apply the episode-flagging function across all gap thresholds
+#' Note: the function developed is in function.R
+hospital_admission_flag_same_day <- flag_admission_episodes(
+  hospitalizations_no_merged,
+  gap_threshold = 0
+) # same day
+
+# 2. Merge admissions within the same episode
+#' Internal note: 2 more records could be merged by removing the seizure-type
+#' condition for merging
+hospitalization_merged_same_day <- hospital_admission_flag_same_day %>%
+  # Keep only unplanned, non-birth admissions and inpatient admissions
+  filter(
+    birth_admission == 0 &
+    planned_admission == 0 &
+    outpatient_admission == 0) %>%
+  group_by(
+    patient_uuid, # by patient
+    episode_id, # by episode identified earlier
+    seizure_related_admission # and by seizure-related flag
+  ) %>%
+  # merge admissions within patient, same episode and seizure diagnosis type
+  summarise(
+    # earliest start in episode
+    admission_age_days_firstDate = min(admission_age_days_firstDate),
+    # latest end in episode
+    admission_age_days_lastDate = max(admission_age_days_lastDate),
+    .groups = "drop"
+  )
+
+# 3. re-run the count of readmissions with new merged records
+# function explained in detail in function.R and main derivation above.
+readmissions_sensit_same_day <- hospitalization_merged_same_day %>%
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  find_readmissions(
+    grouping = "patient_uuid",
+    start_date = "admission_age_days_firstDate",
+    end_date = "admission_age_days_lastDate"
+  ) %>%
+  arrange(patient_uuid, admission_age_days_firstDate)
+
+# 4. re-derive count of 30-day UHRs per index admission with merged records
+readmissions_sensit_same_day_counted <- readmissions_sensit_same_day %>%
+  # Bring in deceased patient information
+  left_join(deceased_patients, by = "patient_uuid") %>%
+  # Bring last record age days to calculate last exposure time at risk
+  left_join(
+    rare_disease_followup_durations_days %>% dplyr::select(
+      patient_uuid,
+      last_record_age_days
+    ),
+    by = "patient_uuid"
+  ) %>%
+  #' Exclude admission record if a patient is deceased during the
+  #' admission period, but retain prior ones for that patient
+  filter(!(patient_uuid %in% deceased_patients &
+    primary_diagnosis_age_days >= admission_age_days_firstDate &
+    primary_diagnosis_age_days <= admission_age_days_lastDate)) %>%
+  arrange(patient_uuid, admission_age_days_firstDate) %>%
+  group_by(patient_uuid) %>%
+  # identify 30-day readmissions for each index admission
+  mutate(
+    # flag index admissions based on readmission variable
+    index_admission = if_else(readmission == "index", 1, 0),
+
+    # create a sequential number for each index admission within patient
+    index_number = cumsum(index_admission),
+
+    # flag last index admission for each patient for last exptime derivation
+    last_index = if_else(index_number == max(index_number), 1, 0),
+
+    # flag 30-day readmissions
+    is_uhr = str_detect(readmission, "30_days_uhr")
+  ) %>%
+  # Group by patient and index number
+  group_by(patient_uuid, index_number) %>%
+  mutate(
+    # count readmissions for each index
+    count_readmissions = sum(is_uhr, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  #  Keep only index admissions
+  filter(index_admission == 1) %>%
+  #' Define exposure time (exptime) for each index admission
+  mutate(
+    exptime = as.integer(
+      case_when(
+        last_index == 1 &
+          (last_record_age_days - admission_age_days_lastDate < 30) ~
+          last_record_age_days - admission_age_days_lastDate,
+        TRUE ~ 30
+      )
+    )
+  ) %>%
+  #' Exclude exp time = 0 (i.e., last record == admission last day)
+  filter(exptime > 0) %>%
+  # order, rename and select variables of interest
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    count_readmissions,
+    exptime
+  )
+
+# 5. Joined dataframe with merged hospitalizations and readmissions
+hospitalizations_sensit_same_day_joined <- purrr::reduce(
+  list(
+    hospitalization_merged_same_day,
+    readmissions_sensit_same_day,
+    readmissions_sensit_same_day_counted
+  ),
+  left_join,
+  by = c(
+    "patient_uuid",
+    "admission_age_days_firstDate",
+    "admission_age_days_lastDate"
+  )
+)
+
+#' 6. join previously derived covariates (from main df) that do not change with
+#'  the merging and depends only on the patient id and admission start day
+#'  (not period dependent)
+hospitalizations_sensit_same_day_joined_cov <- 
+  hospitalizations_sensit_same_day_joined %>%
+  left_join(
+    hospitalization_main_df %>% dplyr::select(
+      patient_uuid,
+      sex,
+      other_epilepsy_mutations,
+      recurrent_variant,
+      neonatal_onset,
+      age_admission_yr,
+      admission_age_days_firstDate,
+      tech_assistance_ever,
+      vns_insertion_ever,
+      n_distinct_asm_admission
+    ),
+    by = c(
+      "patient_uuid",
+      "admission_age_days_firstDate"
+    )
+  )
+
+#' 7. re-derive covariates that may change with new periods in merged records
+#' (i.e. length of stay and adverse effects during hospitalization)
+
+#' 7.a. LOHS and length of stay categories
+admissions_sensit_same_day_lohs <- hospitalizations_sensit_same_day_joined_cov %>%
+  mutate(
+    length_of_stay_days =
+      (admission_age_days_lastDate - admission_age_days_firstDate) + 1,
+    length_of_stay_days_cat = cut(
+      length_of_stay_days,
+      quantile(length_of_stay_days, c(0:3 / 3)),
+      include.lowest = TRUE,
+      labels = c("Bottom", "Middle", "Top")
+    )
+  ) %>%
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    length_of_stay_days,
+    length_of_stay_days_cat
+  )
+
+
+#' 7.b. Respiratory support during admission
+## -- derive first therapeutic procedures and clinical diagnoses
+therapeutic_rec_same_day <- hospitalizations_sensit_same_day_joined_cov %>%
+  # join therapeutic procedures with hospital admissions
+  left_join(
+    rare_disease_therapeutic_procedures,
+    relationship = "many-to-many",
+    by = "patient_uuid"
+  ) %>%
+  # compute overlap flags (either a date or an interval)
+  mutate(
+    procedure_overlap = if_else(
+      !is.na(procedure_age_days_firstDate) &
+        !is.na(procedure_age_days_lastDate) &
+        !is.na(admission_age_days_firstDate) &
+        !is.na(admission_age_days_lastDate) &
+        (admission_age_days_firstDate <= procedure_age_days_lastDate) &
+        (admission_age_days_lastDate >= procedure_age_days_firstDate),
+      TRUE, FALSE
+    ),
+    # keep procedure name only if overlap
+    procedure = if_else(procedure_overlap, procedure, NA_character_)
+  ) %>%
+  # group by admission
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # summarise overlapping procedures (or NA if none)
+  summarise(
+    ther_procedure_name = str_c(
+      unique(na.omit(procedure)),
+      collapse = "; "
+    ),
+    .groups = "drop"
+  ) %>%
+  # rename to procedure for binding rows with clinical diagnoses
+  rename(procedure = ther_procedure_name) %>%
+  arrange(
+    patient_uuid,
+    admission_age_days_firstDate
+  )
+
+
+## -- idenfity clinical diagnoses during admissions
+clinical_diagnosis_same_day <- hospitalizations_sensit_same_day_joined_cov %>%
+  # Joining clinical diagnosis with hospital admission by patient UUID
+  left_join(
+    rare_disease_clinical_diagnosis,
+    relationship = "many-to-many",
+    by = "patient_uuid"
+  ) %>%
+  # Boolean to determine if the procedure has an explicit period that matches the admission period
+  mutate(
+
+    #' Boolean to determine if the clinical diagnosis (procedure) has an
+    #' explicit period that matches the admission period in at least one day
+    procedure_overlap = if_else(
+      !is.na(clinical_diagnosis_age_days_firstDate) &
+        !is.na(clinical_diagnosis_age_days_lastDate) &
+        !is.na(admission_age_days_firstDate) &
+        !is.na(admission_age_days_lastDate) &
+        (admission_age_days_firstDate <= clinical_diagnosis_age_days_lastDate) &
+        (admission_age_days_lastDate >= clinical_diagnosis_age_days_firstDate),
+      TRUE, FALSE
+    ),
+    clinical_diagnosis = if_else(
+      procedure_overlap, clinical_diagnosis, NA_character_
+    )
+  ) %>%
+  #' Filter to retain procedures at hospital admissions:
+  #' either a single-day procedure falls within admission period
+  #' or the procedure period overlaps with the admission period
+  # filter(procedure_overlap) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # Concatenate distinct values into a single cell as temporary variable
+  summarise(
+    clinical_diagnosis = str_c(
+      unique(na.omit(clinical_diagnosis)),
+      collapse = "; "
+    ),
+    .groups = "drop"
+  ) %>%
+  # rename to procedure for binding rows with therapeutic procedures
+  rename(procedure = clinical_diagnosis) %>%
+  arrange(patient_uuid, admission_age_days_firstDate)
+
+## -- identify resp.support during admissions
+admissions_sensit_same_day_resp_supp <- rbind(
+  clinical_diagnosis_same_day,
+  therapeutic_rec_same_day
+) %>%
+  # add a flag if procedure matches respiratory support terms
+  mutate(
+    respiratory_support_flag = case_when(
+      str_detect(
+        procedure,
+        regex(str_c(RESP_SUPPORT_TERMS, collapse = "|"), ignore_case = TRUE)
+      ) &
+        !str_detect(
+          procedure,
+          regex("hypoventilation", ignore_case = TRUE)
+        ) ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  # group by admission
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # summarise as binary factor: "1" if any respiratory support, else "0"
+  summarise(
+   respiratory_support_admission = factor(
+      any(respiratory_support_flag, na.rm = TRUE) * 1,
+       levels = c(0, 1)
+    ),
+  .groups = "drop"
+  ) %>%
+  arrange(patient_uuid, admission_age_days_firstDate)
+
+#' 7.c. adverse events during admissions
+admissions_sensit_same_day_aes <- hospitalizations_sensit_same_day_joined_cov %>%
+  # Join adverse effects episodes
+  left_join(
+    rare_disease_adverse_effects,
+    by = "patient_uuid",
+    relationship = "many-to-many"
+  ) %>%
+  distinct(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    adverse_effect,
+    medication_procedure,
+    adverse_effect_age_days_firstDate,
+    adverse_effect_age_days_lastDate
+  ) %>%
+  # Boolean overlap: adverse event overlaps with admission
+  mutate(
+    adverse_effect_overlap = if_else(
+      !is.na(adverse_effect_age_days_firstDate) &
+        !is.na(adverse_effect_age_days_lastDate) &
+        !is.na(admission_age_days_firstDate) &
+        !is.na(admission_age_days_lastDate) &
+        (adverse_effect_age_days_firstDate <= admission_age_days_lastDate) &
+        (adverse_effect_age_days_lastDate >= admission_age_days_firstDate),
+      TRUE, FALSE
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # Add binary variable (0/1) for adverse effect presence during admission
+  # Note: for those admissions without AE, it was assumed no event (i.e., 0)
+  summarise(
+    adverse_effect_admission = factor(
+      # if there is a match between the adverse effect and the admission
+      # period, then it is an 1, otherwise 0
+      any(adverse_effect_overlap, na.rm = TRUE) * 1),
+    .groups = "drop"
+  )  
+
+#' 7.d- ketogenic diet during admission
+
+#' 7.d. ketogenic diet during admission
+# a. Derivation of ketogenic diet during admission period for 30-day and lohs analyses
+adm_keto_overlap_same_day <- hospitalizations_sensit_same_day_joined_cov %>%
+  left_join(
+    ketogenic_diet_episodes,
+# Check for overlap between *effective* procedure window and admission
+  #' any part of the period starting from day 14 to the end of the
+  #' ketogenic treatment overlaps with the admission
+    join_by(
+      patient_uuid,
+      overlaps(
+        admission_age_days_firstDate,
+        admission_age_days_lastDate,
+        keto_effective_first_day,
+        keto_effective_last_day
+      )
+    )
+  ) %>%
+    # Summarise as binary presence indicator per admission
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+    #' Summarise a binary variable indicating was under ketogenic diet
+  #'  for each hospital admission record (at least one day of match)
+  summarise(
+    #' if there is a match between the effective period of the
+    #' ketogenic diet and the admission period, then it is an 1
+    ketogenic_diet_admission = factor(any(!is.na(keto_effective_first_day)) * 1),
+    .groups = "drop"
+  )
+
+# b. Derivation of ketogenic diet at admission day for sr analysis
+adm_keto_on_admday_same_day <- hospitalizations_sensit_same_day_joined_cov %>%
+  left_join(
+    ketogenic_diet_episodes,
+    # Check for overlap between *effective* procedure window and admission
+  #' any part of the period starting from day 14 to the end of the
+  #' ketogenic treatment overlaps with the admission
+    join_by(
+      patient_uuid,
+      between(admission_age_days_firstDate,
+              keto_effective_first_day,
+              keto_effective_last_day)
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' Summarise a binary variable indicating was under ketogenic diet
+  #'  for each hospital admission record (if there is a match at the day of admission)
+  summarise(
+    #' if the admission day is within the effective period, yes = 1, otherwise 0
+    ketogenic_diet_at_admission_day = factor(any(!is.na(keto_effective_first_day)) * 1),
+    .groups = "drop"
+  )
+
+admissions_sensit_same_day_keto <- adm_keto_overlap_same_day %>%
+  left_join(
+    adm_keto_on_admday_same_day,
+    by = c(
+      "patient_uuid",
+      "admission_age_days_firstDate",
+      "admission_age_days_lastDate"
+    )
+  )
+
+#' 7.e. Quinidine during admission
+#' a) Identify admissions with at least one day matching during admission episodr 
+#' or at the day of admission match with quinidine use. 
+quinidine_during_admission_rec_any_same_day <- hospitalizations_sensit_same_day_joined_cov %>%
+  # Join hospital admissions and quinidine episodes on patient_uuid and overlap of periods
+  left_join(
+    quinidine_use_episodes,
+    join_by(
+      patient_uuid,
+      overlaps(
+        admission_age_days_firstDate,
+        admission_age_days_lastDate,
+        medication_age_days_firstDate,
+        medication_age_days_lastDate
+      )
+    )
+  ) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' Summarise a binary variable indicating quinidine use for each hospital 
+  #' admission record (at least one day of match)
+  summarise(
+    # if there is a match between the quinidine use and the admission
+    # period, then it is an 1, otherwise 0
+    quinidine_admission = factor(any(!is.na(medication_age_days_firstDate)) * 1),
+    .groups = "drop"
+  )
+
+#2.a identify admissions with quinidine already active on the admission day
+quinidine_during_admission_rec_on_day_same_day <- hospitalizations_sensit_same_day_joined_cov %>%
+  # Join hospital admissions and quinidine episodes where admission start is within the quinidine use period
+  left_join(
+    quinidine_use_episodes,
+    join_by(
+      patient_uuid,
+      between(
+        admission_age_days_firstDate,
+        medication_age_days_firstDate,
+        medication_age_days_lastDate
+      )
+    )
+  ) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' Summarise a binary variable indicating quinidine use at the admission day
+  summarise(
+    quinidine_at_admission_day = factor(any(!is.na(medication_age_days_firstDate)) * 1),
+    .groups = "drop"
+  )
+
+#2.b merge both variables into the final df (keep original name)
+admissions_sensit_same_day_quinid <- quinidine_during_admission_rec_any_same_day %>%
+  left_join(
+    quinidine_during_admission_rec_on_day_same_day,
+    by = c(
+      "patient_uuid",
+      "admission_age_days_firstDate",
+      "admission_age_days_lastDate"
+    )
+  )
+
+# 8- List of period-varying covariates to join
+sensit_same_day_time_dfs <- list(
+  admissions_sensit_same_day_lohs, # lohs and lohs categories
+  admissions_sensit_same_day_resp_supp, # respiratory support variable
+  admissions_sensit_same_day_aes, # adverse effects admission variable
+  admissions_sensit_same_day_keto, # ketogenic diet admission variable
+  admissions_sensit_same_day_quinid # quinidine use admission variable
+)
+
+# 9-Joining hospitalization-varying covariates for sensitivity analyses (same day)
+admissions_sensit_same_day_full <- purrr::reduce(
+  sensit_same_day_time_dfs,
+  left_join,
+  .init = hospitalizations_sensit_same_day_joined_cov, # start from prior joined df
+  by = admission_join_var # based on start, end and patient uuid
+)
+
+# 10- Order variables in same way as in main df
+#' Note. this dataframe can be used for all secondary endpoints, and for its use
+#' in 30-day UHRss, the index in readmissions should be filtered.
+admissions_sensit_same_day_full <- admissions_sensit_same_day_full %>%
+  mutate(
+    patient_uuid = as.factor(patient_uuid)
+  ) %>%
+  # select and order variables of interest in joined df
+  dplyr::select(
+    # patient identifier
+    patient_uuid,
+    # admissions related features
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    # demographics
+    sex,
+    age_admission_yr,
+    # follow up and disease onset
+    neonatal_onset,
+    # genetic mutations
+    other_epilepsy_mutations,
+    recurrent_variant,
+    # clinical history
+    seizure_related_admission,
+    length_of_stay_days,
+    length_of_stay_days_cat,
+    respiratory_support_admission,
+    tech_assistance_ever,
+    readmission,
+    count_readmissions,
+    exptime,
+    # treatment history
+    vns_insertion_ever,
+    n_distinct_asm_admission,
+    adverse_effect_admission,
+    ketogenic_diet_admission,
+    ketogenic_diet_at_admission_day,
+    quinidine_admission,
+    quinidine_at_admission_day
+  ) %>%
+  # arrange by patient uuid and admission day
+  arrange(patient_uuid, admission_age_days_firstDate)
+```
+
+#### Hospitalization occurs on the NEXT day as the prior discharge day
+
+```{r}
+#| label: admissions-merged-episodes-nextday
+#| echo: false
+#| results: false
+#' gap_threshold = 1 → next hospitalization record starts on the *next day (+1)*
+#'  after the previous discharge (for the same patient and with the same type
+#'   of sr diagnosis)
+
+# 1. Apply the episode-flagging function across all gap thresholds
+#' Note: the function developed is in function.R
+hospital_admission_flag_next_day <- flag_admission_episodes(
+  hospitalizations_no_merged,
+  gap_threshold = 1
+) # next day
+
+# 2. Merge admissions within the same episode
+#' Internal note: 4 more records could be merged if removing the seizure-type
+#' condition for merging
+hospitalization_merged_next_day <- hospital_admission_flag_next_day %>%
+  # Keep only unplanned, non-birth admissions
+  filter(
+    birth_admission == 0 &
+    planned_admission == 0 &
+    outpatient_admission == 0) %>%
+  group_by(
+    patient_uuid, # by patient
+    episode_id, # by episode identified earlier
+    seizure_related_admission # and by seizure-related flag
+  ) %>%
+  # merge admissions within patient, same episode and seizure diagnosis type
+  summarise(
+    # earliest start in episode
+    admission_age_days_firstDate = min(admission_age_days_firstDate),
+    # latest end in episode
+    admission_age_days_lastDate = max(admission_age_days_lastDate),
+    .groups = "drop"
+  )
+
+# 3. Re-run the count of readmissions with new merged records
+readmissions_sensit_next_day <- hospitalization_merged_next_day %>%
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  find_readmissions(
+    grouping = "patient_uuid",
+    start_date = "admission_age_days_firstDate",
+    end_date = "admission_age_days_lastDate"
+  ) %>%
+  arrange(patient_uuid, admission_age_days_firstDate)
+
+# 4. re-derive count of 30-day UHRs per index admission with merged records
+readmissions_sensit_next_day_counted <- readmissions_sensit_next_day %>%
+  # Bring in deceased patient information
+  left_join(deceased_patients, by = "patient_uuid") %>%
+  # Bring last record age days to calculate last exposure time at risk
+  left_join(
+    rare_disease_followup_durations_days %>% dplyr::select(
+      patient_uuid,
+      last_record_age_days
+    ),
+    by = "patient_uuid"
+  ) %>%
+  #' Exclude admission record if a patient is deceased during the
+  #' admission period, but retain prior ones for that patient
+  filter(!(patient_uuid %in% deceased_patients &
+    primary_diagnosis_age_days >= admission_age_days_firstDate &
+    primary_diagnosis_age_days <= admission_age_days_lastDate)) %>%
+  arrange(patient_uuid, admission_age_days_firstDate) %>%
+  group_by(patient_uuid) %>%
+  # identify 30-day readmissions for each index admission
+  mutate(
+    # flag index admissions based on readmission variable
+    index_admission = if_else(readmission == "index", 1, 0),
+
+    # create a sequential number for each index admission within patient
+    index_number = cumsum(index_admission),
+
+    # flag last index admission for each patient for last exptime derivation
+    last_index = if_else(index_number == max(index_number), 1, 0),
+
+    # flag 30-day readmissions
+    is_uhr = str_detect(readmission, "30_days_uhr")
+  ) %>%
+  # Group by patient and index number
+  group_by(patient_uuid, index_number) %>%
+  mutate(
+    # count readmissions for each index
+    count_readmissions = sum(is_uhr, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  #  Keep only index admissions
+  filter(index_admission == 1) %>%
+  #' Define exposure time (exptime) for each index admission:
+  #' Use 30 days as default  unless censored earlier for last index admission
+  mutate(
+    exptime = as.integer(
+      case_when(
+        last_index == 1 &
+          (last_record_age_days - admission_age_days_lastDate < 30) ~
+          last_record_age_days - admission_age_days_lastDate,
+        TRUE ~ 30
+      )
+    )
+  ) %>%
+  #' Exclude exp time = 0 (i.e., last record == admission last day),
+  #' as there is no time to follow up after last index admission
+  filter(exptime > 0) %>%
+  # order, rename and select variables of interest
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    count_readmissions,
+    exptime
+  )
+
+# 5. Joined dataframe with merged hospitalizations and readmissions
+hospitalizations_sensit_next_day_joined <- purrr::reduce(
+  list(
+    hospitalization_merged_next_day,
+    readmissions_sensit_next_day,
+    readmissions_sensit_next_day_counted
+  ),
+  left_join,
+  by = c(
+    "patient_uuid",
+    "admission_age_days_firstDate",
+    "admission_age_days_lastDate"
+  )
+)
+
+#' 6. join previously derived covariates (from main df) that do not change with
+#'  the merging and depends only on the patient id and admission start day
+#'  (not period dependent)
+hospitalizations_sensit_next_day_joined_cov <- hospitalizations_sensit_next_day_joined %>%
+  left_join(
+    hospitalization_main_df %>% dplyr::select(
+      patient_uuid,
+      sex,
+      other_epilepsy_mutations,
+      recurrent_variant,
+      neonatal_onset,
+      age_admission_yr,
+      admission_age_days_firstDate,
+      tech_assistance_ever,
+      vns_insertion_ever,
+      n_distinct_asm_admission
+    ),
+    by = c(
+      "patient_uuid",
+      "admission_age_days_firstDate"
+    )
+  )
+
+#' 7. re-derive covariates that may change with new periods in merged records
+#' (i.e. length of stay and adverse effect during hospitalization)
+#' 6.q. LOHS and length of stay categories
+admissions_sensit_next_day_lohs <- hospitalizations_sensit_next_day_joined %>%
+  mutate(
+    # Derivation of continuous length of hospital stays in days
+    length_of_stay_days =
+      (admission_age_days_lastDate - admission_age_days_firstDate) + 1,
+
+    #' Derivation of length of hospital stays in 3 categories by tertiles
+    length_of_stay_days_cat = cut(
+      length_of_stay_days,
+      # cut in tertiles
+      quantile(length_of_stay_days, c(0:3 / 3)),
+      include.lowest = T,
+      labels = c("Bottom", "Middle", "Top")
+    )
+  ) %>%
+  # select variables of interest
+  dplyr::select(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    length_of_stay_days,
+    length_of_stay_days_cat
+  )
+
+#' 7.b.- respiratory support during admission
+#--derive first therapeutic procedures and clinical diagnoses
+therapeutic_rec_next_day <- hospitalizations_sensit_next_day_joined %>%
+  # join therapeutic procedures with hospital admissions
+  left_join(
+    rare_disease_therapeutic_procedures,
+    relationship = "many-to-many",
+    by = "patient_uuid"
+  ) %>%
+  # compute overlap flags (either a date or an interval)
+  mutate(
+    procedure_overlap = if_else(
+      !is.na(procedure_age_days_firstDate) &
+        !is.na(procedure_age_days_lastDate) &
+        !is.na(admission_age_days_firstDate) &
+        !is.na(admission_age_days_lastDate) &
+        (admission_age_days_firstDate <= procedure_age_days_lastDate) &
+        (admission_age_days_lastDate >= procedure_age_days_firstDate),
+      TRUE, FALSE
+    ),
+    # keep procedure name only if overlap
+    procedure = if_else(procedure_overlap, procedure, NA_character_)
+  ) %>%
+  # group by admission
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # summarise overlapping procedures (or NA if none)
+  summarise(
+    ther_procedure_name = str_c(
+      unique(na.omit(procedure)),
+      collapse = "; "
+    ),
+    .groups = "drop"
+  ) %>%
+  # rename to procedure for binding rows with clinical diagnoses
+  rename(procedure = ther_procedure_name) %>%
+  arrange(
+    patient_uuid,
+    admission_age_days_firstDate
+  )
+
+
+## -- idenfity clinical diagnoses during admissions
+clinical_diagnosis_next_day <- hospitalizations_sensit_next_day_joined %>%
+  # Joining clinical diagnosis with hospital admission by patient UUID
+  left_join(
+    rare_disease_clinical_diagnosis,
+    relationship = "many-to-many",
+    by = "patient_uuid"
+  ) %>%
+  # Boolean to determine if the procedure has an explicit period that matches the admission period
+  mutate(
+
+    #' Boolean to determine if the clinical diagnosis (procedure) has an
+    #' explicit period that matches the admission period in at least one day
+    procedure_overlap = if_else(
+      !is.na(clinical_diagnosis_age_days_firstDate) &
+        !is.na(clinical_diagnosis_age_days_lastDate) &
+        !is.na(admission_age_days_firstDate) &
+        !is.na(admission_age_days_lastDate) &
+        (admission_age_days_firstDate <= clinical_diagnosis_age_days_lastDate) &
+        (admission_age_days_lastDate >= clinical_diagnosis_age_days_firstDate),
+      TRUE, FALSE
+    ),
+    clinical_diagnosis = if_else(
+      procedure_overlap, clinical_diagnosis, NA_character_
+    )
+  ) %>%
+  #' Filter to retain procedures at hospital admissions:
+  #' either a single-day procedure falls within admission period
+  #' or the procedure period overlaps with the admission period
+  # filter(procedure_overlap) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # Concatenate distinct values into a single cell as temporary variable
+  summarise(
+    clinical_diagnosis = str_c(
+      unique(na.omit(clinical_diagnosis)),
+      collapse = "; "
+    ),
+    .groups = "drop"
+  ) %>%
+  # rename to procedure for binding rows with therapeutic procedures
+  rename(procedure = clinical_diagnosis) %>%
+  arrange(patient_uuid, admission_age_days_firstDate)
+
+## -- identify resp.support during admissions
+admissions_sensit_next_day_resp_supp <- rbind(
+  clinical_diagnosis_next_day,
+  therapeutic_rec_next_day
+) %>%
+  # add a flag if procedure matches respiratory support terms
+  mutate(
+    respiratory_support_flag = case_when(
+      str_detect(
+        procedure,
+        regex(str_c(RESP_SUPPORT_TERMS, collapse = "|"), ignore_case = TRUE)
+      ) &
+        !str_detect(
+          procedure,
+          regex("hypoventilation", ignore_case = TRUE)
+        ) ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  # group by admission
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # summaries as binary factor: "1" if any respiratory support, else "0"
+  summarise(
+   respiratory_support_admission = factor(
+      any(respiratory_support_flag, na.rm = TRUE) * 1,
+       levels = c(0, 1)
+    ),
+  .groups = "drop"
+  ) %>%
+  arrange(patient_uuid, admission_age_days_firstDate)
+
+#' 7.c. adverse effect during admissions
+admissions_sensit_next_day_aes <- hospitalizations_sensit_next_day_joined %>%
+  # Join adverse effect episodes
+  left_join(
+    rare_disease_adverse_effects,
+    by = "patient_uuid",
+    relationship = "many-to-many"
+  ) %>%
+  distinct(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    adverse_effect,
+    medication_procedure,
+    adverse_effect_age_days_firstDate,
+    adverse_effect_age_days_lastDate
+  ) %>%
+  # Boolean overlap: adverse effect overlaps with admission
+  mutate(
+    adverse_effect_overlap = if_else(
+      !is.na(adverse_effect_age_days_firstDate) &
+        !is.na(adverse_effect_age_days_lastDate) &
+        !is.na(admission_age_days_firstDate) &
+        !is.na(admission_age_days_lastDate) &
+        (adverse_effect_age_days_firstDate <= admission_age_days_lastDate) &
+        (adverse_effect_age_days_lastDate >= admission_age_days_firstDate),
+      TRUE, FALSE
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  # Add binary variable (0/1) for adverse effect presence during admission
+  # Note: for those admissions without AE, it was assumed no event (i.e., 0)
+  summarise(
+    adverse_effect_admission = factor(
+      # if there is a match between the adverse effect and the admission
+      # period, then it is an 1, otherwise 0
+      any(adverse_effect_overlap, na.rm = TRUE) * 1),
+    .groups = "drop"
+  )  
+
+#' 7.d. ketogenic diet during admission
+# a. Derivation of ketogenic diet during admission period for 30-day and lohs analyses
+adm_keto_overlap_next_day <- hospitalizations_sensit_next_day_joined %>%
+  left_join(
+    ketogenic_diet_episodes,
+# Check for overlap between *effective* procedure window and admission
+  #' any part of the period starting from day 14 to the end of the
+  #' ketogenic treatment overlaps with the admission
+    join_by(
+      patient_uuid,
+      overlaps(
+        admission_age_days_firstDate,
+        admission_age_days_lastDate,
+        keto_effective_first_day,
+        keto_effective_last_day
+      )
+    )
+  ) %>%
+    # Summarise as binary presence indicator per admission
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+    #' Summarise a binary variable indicating was under ketogenic diet
+  #'  for each hospital admission record (at least one day of match)
+  summarise(
+    #' if there is a match between the effective period of the
+    #' ketogenic diet and the admission period, then it is an 1
+    ketogenic_diet_admission = factor(any(!is.na(keto_effective_first_day)) * 1),
+    .groups = "drop"
+  )
+
+# b. Derivation of ketogenic diet at admission day for sr analysis
+adm_keto_on_admday_next_day <- hospitalizations_sensit_next_day_joined %>%
+  left_join(
+    ketogenic_diet_episodes,
+    # Check for overlap between *effective* procedure window and admission
+  #' any part of the period starting from day 14 to the end of the
+  #' ketogenic treatment overlaps with the admission
+    join_by(
+      patient_uuid,
+      between(admission_age_days_firstDate,
+              keto_effective_first_day,
+              keto_effective_last_day)
+    )
+  ) %>%
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' Summarise a binary variable indicating was under ketogenic diet
+  #'  for each hospital admission record (if there is a match at the day of admission)
+  summarise(
+    #' if the admission day is within the effective period, yes = 1, otherwise 0
+    ketogenic_diet_at_admission_day = factor(any(!is.na(keto_effective_first_day)) * 1),
+    .groups = "drop"
+  )
+
+admissions_sensit_next_day_keto <- adm_keto_overlap_next_day %>%
+  left_join(
+    adm_keto_on_admday_next_day,
+    by = c(
+      "patient_uuid",
+      "admission_age_days_firstDate",
+      "admission_age_days_lastDate"
+    )
+  )
+
+#' 7.e. Quinidine during admission
+
+#2. identify admissions with matching use of quinidine in at least one day
+#   (using inequality join with overlaps)
+
+#' a) Identify admissions with at least one day matching during admission episodr 
+#' or at the day of admission match with quinidine use. 
+quinidine_during_admission_rec_any_next_day <- hospitalizations_sensit_next_day_joined %>%
+  # Join hospital admissions and quinidine episodes on patient_uuid and overlap of periods
+  left_join(
+    quinidine_use_episodes,
+    join_by(
+      patient_uuid,
+      overlaps(
+        admission_age_days_firstDate,
+        admission_age_days_lastDate,
+        medication_age_days_firstDate,
+        medication_age_days_lastDate
+      )
+    )
+  ) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' Summarise a binary variable indicating quinidine use for each hospital 
+  #' admission record (at least one day of match)
+  summarise(
+    # if there is a match between the quinidine use and the admission
+    # period, then it is an 1, otherwise 0
+    quinidine_admission = factor(any(!is.na(medication_age_days_firstDate)) * 1),
+    .groups = "drop"
+  )
+
+#2.a identify admissions with quinidine already active on the admission day
+quinidine_during_admission_rec_on_day_next_day <- hospitalizations_sensit_next_day_joined %>%
+  # Join hospital admissions and quinidine episodes where admission start is within the quinidine use period
+  left_join(
+    quinidine_use_episodes,
+    join_by(
+      patient_uuid,
+      between(
+        admission_age_days_firstDate,
+        medication_age_days_firstDate,
+        medication_age_days_lastDate
+      )
+    )
+  ) %>%
+  # Group by patient and admission periods
+  group_by(
+    patient_uuid,
+    admission_age_days_firstDate,
+    admission_age_days_lastDate
+  ) %>%
+  #' Summarise a binary variable indicating quinidine use at the admission day
+  summarise(
+    quinidine_at_admission_day = factor(any(!is.na(medication_age_days_firstDate)) * 1),
+    .groups = "drop"
+  )
+
+#2.b merge both variables into the final df (keep original name)
+admissions_sensit_next_day_quinid <- quinidine_during_admission_rec_any_next_day %>%
+  left_join(
+    quinidine_during_admission_rec_on_day_next_day,
+    by = c(
+      "patient_uuid",
+      "admission_age_days_firstDate",
+      "admission_age_days_lastDate"
+    )
+  )
+
+# 8- List of time-varying covariates to join
+sensit_next_day_time_dfs <- list(
+  admissions_sensit_next_day_lohs, # lohs and lohs categories
+  admissions_sensit_next_day_resp_supp, # respiratory support variable
+  admissions_sensit_next_day_aes, # adverse effect admission variable
+  admissions_sensit_next_day_keto, # ketogenic diet admission variable
+  admissions_sensit_next_day_quinid # quinidine use admission variable
+)
+
+# 9- joining hosptialization-varying covariates for sensitivity analyses (next day)
+admissions_sensit_next_day_full <- purrr::reduce(
+  sensit_next_day_time_dfs,
+  left_join,
+  .init = hospitalizations_sensit_next_day_joined_cov, # start from previos joined
+  by = admission_join_var # based on start, end and patient uuid
+)
+
+#10- order variables in same way as in main df
+#' Note: this dataframe can be used for all secondary endpoints, and for its use
+#' in 30-day UHRss, the index in readmissions should be filtered.
+admissions_sensit_next_day_full <- admissions_sensit_next_day_full %>%
+  # select and order variables of interest in joined df
+  mutate(
+    patient_uuid = as.factor(patient_uuid)
+  ) %>%
+  # select and order variables of interest in joined df
+  dplyr::select(
+    # patient identifier
+    patient_uuid,
+    # admissions related features
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    # demographics
+    sex,
+    age_admission_yr,
+    # follow up and disease onset
+    neonatal_onset,
+    # genetic mutations
+    other_epilepsy_mutations,
+    recurrent_variant,
+    # clinical history
+    seizure_related_admission,
+    length_of_stay_days,
+    length_of_stay_days_cat,
+    respiratory_support_admission,
+    tech_assistance_ever,
+    readmission,
+    count_readmissions,
+    exptime,
+    # treatment history
+    vns_insertion_ever,
+    n_distinct_asm_admission,
+    adverse_effect_admission,
+    ketogenic_diet_admission,
+    ketogenic_diet_at_admission_day,
+    quinidine_admission,
+    quinidine_at_admission_day
+  ) %>%
+  # arrange by patient uuid and admission day
+  arrange(patient_uuid, admission_age_days_firstDate)
+```
+
+```{r}
+#| label: save-sensitivity-df-file-admissions-merging
+#| results: false
+#| warning: false
+#| message: false
+
+# create temp dir to save file
+dir.create("~/RWE-rare_disease/Hospitalizations/output/data")
+
+# save df as rds file
+saveRDS(admissions_sensit_same_day_full, "data/admissions_sensit_same_day_full.rds")
+saveRDS(admissions_sensit_next_day_full, "data/admissions_sensit_next_day_full.rds")
+
+# Upload final df to GCS
+gcs_upload("~/RWE-rare_disease/Hospitalizations/output/data/admissions_sensit_same_day_full.rds",
+  bucket = "YOUR_GCS_BUCKET",
+  name = "MSM_Hospitalizations/admissions_sensit_same_day_full.rds"
+)
+
+gcs_upload("~/RWE-rare_disease/Hospitalizations/output/data/admissions_sensit_next_day_full.rds",
+  bucket = "YOUR_GCS_BUCKET",
+  name = "MSM_Hospitalizations/admissions_sensit_next_day_full.rds"
+)
+```
+
+### Including planned admissions
+
+```{r}
+#| label: include-planned-admissions-df-lohs-sensitivity-analyses
+#| echo: false
+
+#' Definition (SAP):
+#' The main analysis will be repeated but extended to include hospital 
+#' admissions records categorized as "planned” according to the ‘admission 
+#' diagnosis’ variable in the hospital admission table. 
+#' Note: this df will be used for both LOHS endpoint and SR admissions and 
+#' we start from the main df with all covariates
+
+lohs_sr_df_planned <- hospitalization_main_df %>%
+  # do not remove planned admissions, only birth and outpatient admissions
+  filter(
+    birth_admission == 0, # Exclude birth admissions
+    outpatient_admission == 0 # Exclude outpatient admissions
+  ) %>%
+  dplyr::select(
+    # patient identifier
+    patient_uuid,
+    # admissions related features
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    # demographics
+    sex,
+    age_admission_yr,
+    # follow up and disease onset
+    neonatal_onset,
+    # genetic mutations
+    other_epilepsy_mutations,
+    recurrent_variant,
+    # clinical history
+    seizure_related_admission,
+    length_of_stay_days,
+    length_of_stay_days_cat,
+    respiratory_support_admission,
+    tech_assistance_ever,
+    # treatment history
+    vns_insertion_ever,
+    n_distinct_asm_admission,
+    adverse_effect_admission,
+    ketogenic_diet_admission,
+    ketogenic_diet_at_admission_day,
+    quinidine_admission,
+    quinidine_at_admission_day
+    )
+```
+
+```{r}
+#| label: save-sensitivity-df-file-lohs-and-sr-admissions-planned
+#| results: false
+#| warning: false
+#| message: false
+
+# create temp dir to save file
+dir.create("~/RWE-rare_disease/Hospitalizations/output/data")
+
+# save df as rds file
+saveRDS(lohs_sr_df_planned, "data/lohs_sr_df_planned.rds")
+
+# Upload final df to GCS
+gcs_upload("~/RWE-rare_disease/Hospitalizations/output/data/lohs_sr_df_planned.rds",
+  bucket = "YOUR_GCS_BUCKET",
+  name = "MSM_Hospitalizations/lohs_sr_df_planned.rds"
+)
+```
+
+### Excluding outliers (only to LOHS)
+
+```{r}
+#| label: outlier-exclusion-df-sensitivity-analyses
+#| echo: false
+
+#' Definition (SAP) updated after checking an approximately log-normal distribution of LOHS
+#' https://www.sciencedirect.com/science/article/pii/S0031699725074575?ref=cra_js_challenge&fr=RR-1
+#' Outliers will be identified based on the distribution of the log-transformed 
+#' length of hospital stay (LOHS). 
+#' Specifically, any value of log(LOHS) below the first quartile minus 1.5 times
+#'  the interquartile range (IQR), or above the third quartile plus 1.5 × IQR,
+#'   will be considered an outlier and excluded from the analysis.
+#'    
+#'    For this sensitivity analysis, we will start from the main df with all
+#'     covariates
+
+lohs_df_outliers <- hospitalization_main_df %>%
+  filter(
+    birth_admission == 0, # Exclude birth admissions
+    planned_admission == 0, # Exclude planned admissions
+    outpatient_admission == 0 # Exclude outpatient admissions
+  ) %>%
+  dplyr::select(
+    # patient identifier
+    patient_uuid,
+    # admissions related features
+    admission_age_days_firstDate,
+    admission_age_days_lastDate,
+    # demographics
+    sex,
+    age_admission_yr,
+    # follow up and disease onset
+    neonatal_onset,
+    # genetic mutations
+    other_epilepsy_mutations,
+    recurrent_variant,
+    # clinical history
+    seizure_related_admission,
+    length_of_stay_days,
+    respiratory_support_admission,
+    tech_assistance_ever,
+    # treatment history
+    vns_insertion_ever,
+    n_distinct_asm_admission,
+    adverse_effect_admission,
+    ketogenic_diet_admission,
+    quinidine_admission
+    ) %>%
+  # add log(LOHS)
+  mutate(log_lohs = log(length_of_stay_days)) 
+
+# Compute IQR bounds on the LOG scale
+Q1_log  <- quantile(lohs_df_outliers$log_lohs, 0.25, na.rm = TRUE)
+Q3_log  <- quantile(lohs_df_outliers$log_lohs, 0.75, na.rm = TRUE)
+IQR_log <- Q3_log - Q1_log
+
+lower_log <- max(0, Q1_log - 1.5 * IQR_log)
+upper_log <- Q3_log + 1.5 * IQR_log
+
+# Filter rows by keeping ONLY observations within the LOG bounds
+log_lohs_df_outliers <- lohs_df_outliers %>%
+  filter(log_lohs >= lower_log, log_lohs <= upper_log) %>%
+  dplyr::select(-log_lohs)
+```
+
+```{r}
+#| label: save-sensitivity-df-file-lohs-outliers
+#| results: false
+#| warning: false
+#| message: false
+
+# create temp dir to save file
+dir.create("~/RWE-rare_disease/Hospitalizations/output/data")
+
+# save df as rds file
+saveRDS(log_lohs_df_outliers, "data/log_lohs_df_outliers.rds")
+
+# Upload final df to GCS
+gcs_upload("~/RWE-rare_disease/Hospitalizations/output/data/log_lohs_df_outliers.rds",
+  bucket = "YOUR_GCS_BUCKET",
+  name = "MSM_Hospitalizations/log_lohs_df_outliers.rds"
+)
+```
+
+```{r}
+#| label: remove-temp-files-end
+#| results: false
+#| warning: false
+#| message: false
+
+# remove temp files
+list.files(path = ".", pattern = NULL, all.files = FALSE, full.names = FALSE)
+
+# delete from local files
+unlink("~/RWE-rare_disease/Hospitalizations/output/data", recursive = TRUE)
+```
