@@ -4,7 +4,7 @@ The repository includes implementations of:
 - Natural History studies for a rare neurological disease (nhs folder)
 - Summary statistics for age-subgrouping analysis for a rare neurological disease (severity_outcomes folder)
 - Causal inference for observational data (causal inference folder)
-- Control quality example (shiny dashboard)
+- Control quality example (qc dashboard)
 
 **Modeling Approaches:** 
 - Time-to-event modeling frameworks
