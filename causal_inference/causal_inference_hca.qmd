@@ -1,0 +1,828 @@
+---
+title: "Causal inference approach aimed to hybrid control arm design" 
+author: "David Herman"    
+date: today                                         
+format:
+  # ↓ html file
+  html:
+    embed-resources: true  # Embed CSS, JS, and images into the HTML file
+    toc: true              # Include a table of contents
+    toc-depth: 4           # Show headings up to level 4 in the TOC
+    toc-location: right    # Place TOC on the right side
+    number-sections: true  # Automatically number section headings
+    code-fold: false       # Do not collapse code blocks by default
+editor: source      
+execute:
+  echo: true                # Display R code in the reports as default
+  warning: false            # Suppress warnings in the output
+  message: false            # Suppress messages in the output
+---
+
+# Introduction
+
+This turorial was created with the aim of simulating and applying different weightening/balancing strategies to the Hybrid Control Arm (HCA) study using retrospective RWD to augment the internal control arm of the trial that has the standard treatment. 
+
+The trial objective is to compare the interventional drug (Treatment arm) against a reconstructed hybrid arm. This hybrid arm integrates the prospectively randomized patients (internal controls with standard treatment) with an external control RWD patients treated with standard treatment.
+
+By supplementing the internal control with historical RWD, we aim to perform a matched/weighted based study to perform comparative study between patients under the interventional drug and the reconstructed hybrid arm (standard care).
+
+This tutorial implemented the method explained by Majumdmar et al 2022: Design of a Confirmatory trial with a Hybrid Randomized and External Control Arm. At the end, unmeasured confounding methods were also applied given the context for an internal project at my placework.
+
+# Objective
+
+To assess the comparable efficacy of the interventional drug ("treatment drug") to the hybrid arm ("standard care drug") among the patients with a type of hematologic rare disease. Efficacy will be assed as CR+PR by 4 months according to IWG 2006 criteria.
+
+# Data source
+
+Simulated data set using RTC sample size (treatment arm and control/standard care) and RWD expected:
+
+- Trial: data from 48 patients (R 2:1, TREATMENT_DRUG:32 and STANDARD_DRUG:16)
+- External Data (from EHR): retrospective data from 18 patients with a type of hematologic rare diseaseS treated with STANDARD_DRUG and have comparable eligibility criteria to the trial.
+
+To keep the adjustment strategy transparent, we retain a reduced confounder set compared to the original study:
+
+-   `treat_drug`: YES = 1, NO  = 0 (binary variable "A")
+-   `cr_pr_4m`: CR+PR by 4 months according to IWG 2006 criteria (binary variable "Y")
+-   `age`: age in years
+-   `sex`: sex (1 = male)
+-   `race`: categorical variable
+-   `bmi`: categorical variable
+-   `ECOG`: categorical variable
+
+```{r}
+#| label: load-libraries
+
+library(causaldata) # Provides datasets used in causal inference, including the NHEFS
+library(tidyverse) # Core data science workflow
+library(ggdag) # Visualization tools for directed acyclic graphs (DAGs)
+library(broom) # Converts model objects (e.g., lm, glm) into tidy df.
+library(dagitty) # Formal specification and analysis of causal DAGs
+library(MatchIt) # Implements propensity score matching algorithms
+library(WeightIt) # Implements propensity score weighting and balancing approaches
+library(cobalt) # Covariate balance diagnostics and visualization
+library(ggplot2) # Grammar of graphics plotting system
+library(glmnet) # LASSO log regression (appendix)
+library(patchwork) # combined plots
+library(rsample)
+library(lmtest)
+library(plm)
+library(EValue) # e-value method for unmeasured confounding
+library(tipr) # for tipping point analysis for unmeasured confounding
+```
+
+```{r}
+#| label: simulate-data-sets
+
+set.seed(20260310)
+
+# -----------------------------
+# 1. Helper functions
+# -----------------------------
+
+rbern <- function(n, p) rbinom(n, size = 1, prob = p)
+
+# Simulate baseline covariates
+sim_covariates <- function(n, source = c("trial", "rwd")) {
+  source <- match.arg(source)
+
+  if (source == "trial") {
+    tibble(
+      age = round(rnorm(n, mean = 73, sd = 7)),
+      sex = rbern(n, 0.62), # 1 = male
+      race = sample(
+        c("White", "Other"),
+        size = n,
+        replace = TRUE,
+        prob = c(0.70, 0.3)
+      ),
+      bmi = sample(
+        c("<25", "25-30", ">=30"),
+        size = n,
+        replace = TRUE,
+        prob = c(0.30, 0.45, 0.25)
+      ),
+      ECOG = sample(
+        c("0", ">1"),
+        size = n,
+        replace = TRUE,
+        prob = c(0.25, 0.75)
+      )
+    )
+  } else {
+    # External RWD made slightly older / less fit on average
+    tibble(
+      age = round(rnorm(n, mean = 75, sd = 8)),
+      sex = rbern(n, 0.68),
+      race = sample(
+        c("White", "Other"),
+        size = n,
+        replace = TRUE,
+        prob = c(0.72, 0.28)
+      ),
+      bmi = sample(
+        c("<25", "25-30", ">=30"),
+        size = n,
+        replace = TRUE,
+        prob = c(0.36, 0.42, 0.22)
+      ),
+      ECOG = sample(
+        c("0", ">1"),
+        size = n,
+        replace = TRUE,
+        prob = c(0.18, 0.62)
+      )
+    )
+  }
+}
+
+# Baseline NO response probability
+# Keep this simple and interpretable
+get_p_aza <- function(age, sex, race, bmi, ECOG) {
+  p <- 0.30 +
+    ifelse(age < 70, 0.05, 0) +
+    ifelse(age >= 80, -0.05, 0) +
+    ifelse(sex == 1, -0.02, 0) +
+    ifelse(race == "White", 0.03, 0) +
+    ifelse(race == "Other", -0.02, 0) +
+    ifelse(bmi == "25-30", 0.03, 0) +
+    ifelse(bmi == ">=30", -0.03, 0) +
+    ifelse(ECOG == "0", -0.05, 0) +
+    ifelse(ECOG == ">1", -0.12, 0)
+
+  pmin(pmax(p, 0.05), 0.80)
+}
+
+# -----------------------------
+# 2. Trial data
+# -----------------------------
+
+n_trial <- 48
+n_ivo <- 32
+n_aza <- 16
+
+trial_cov <- sim_covariates(n_trial, source = "trial")
+
+df_trial <- trial_cov %>%
+  mutate(
+    patient_id = paste0("TRIAL_", sprintf("%03d", 1:n_trial)),
+    source = "trial",
+    treat_drug = c(rep(1, n_ivo), rep(0, n_aza)), # 1 = YES, 0 = NO
+    p_aza = get_p_aza(age, sex, race, bmi, ECOG),
+    # drug effect estimated to be +30 percentage points over standard treatment (NO)
+    p_response = ifelse(treat_drug == 1, pmin(p_aza + 0.30, 0.95), p_aza),
+    cr_pr_4m = rbern(n_trial, p_response)
+  ) %>%
+  dplyr::select(
+    patient_id,
+    source,
+    treat_drug,
+    cr_pr_4m,
+    age,
+    sex,
+    race,
+    bmi,
+    ECOG
+  )
+
+# -----------------------------
+# 3. External RWD data
+# -----------------------------
+
+n_rwd <- 18
+
+rwd_cov <- sim_covariates(n_rwd, source = "rwd")
+
+df_rwd <- rwd_cov %>%
+  mutate(
+    patient_id = paste0("RWD_", sprintf("%03d", 1:n_rwd)),
+    source = "rwd",
+    treat_drug = 0, # all external patients are NO
+    p_aza = get_p_aza(age, sex, race, bmi, ECOG),
+    p_response = p_aza,
+    cr_pr_4m = rbern(n_rwd, p_response)
+  ) %>%
+  dplyr::select(
+    patient_id,
+    source,
+    treat_drug,
+    cr_pr_4m,
+    age,
+    sex,
+    race,
+    bmi,
+    ECOG
+  )
+
+# -----------------------------
+# 4. Optional combined dataset
+# -----------------------------
+
+df_all <- bind_rows(df_trial, df_rwd) %>%
+  mutate(
+    treat_drug = factor(treat_drug, levels = c(0, 1), labels = c("NO", "YES")),
+    sex = factor(sex, levels = c(0, 1), labels = c("Female", "Male")),
+    source = factor(source, levels = c("trial", "rwd")),
+    ECOG = factor(ECOG, levels = c("0", ">1")),
+    bmi = factor(bmi, levels = c("<25", "25-30", ">=30")),
+    race = factor(race)
+  )
+
+# -----------------------------
+# 5. Quick checks
+# -----------------------------
+
+table(df_trial$treat_drug)
+table(df_rwd$treat_drug)
+
+df_trial %>%
+  count(treat_drug, cr_pr_4m)
+
+df_rwd %>%
+  count(cr_pr_4m)
+
+df_all %>%
+  group_by(source, treat_drug) %>%
+  summarise(
+    n = n(),
+    resp_rate = mean(cr_pr_4m),
+    mean_age = mean(age),
+    .groups = "drop"
+  )
+
+head(df_trial)
+head(df_rwd)
+```
+
+```{r}
+df_all <- df_all %>%
+  mutate(
+    A = ifelse(treat_drug == "YES", 1, 0),
+    Y = cr_pr_4m,
+    in_trial = ifelse(source == "trial", 1, 0)
+  ) %>%
+  mutate(
+    treat_drug = factor(treat_drug, levels = c("NO", "YES"))
+  )
+
+head(df_all)
+```
+
+# Target Estimand and Identification
+
+The objective is to estimate the Average Treatment Effect in the Treated (ATT) of the new interventional drug on the response rate (CR+PR) at 4 months, defined as the mean difference in potential outcomes among patients who received the new drug:
+
+E[Y(1)−Y(0)∣A=1]
+
+where:
+
+-   A = Treatment (`treat_drug`)
+-   Y = CR+PR by 4 months (`cr_pr_4m`)
+
+Under the assumed causal structure, baseline covariates that affect both treatment assignment and outcome constitute the backdoor adjustment set:
+
+Z = {age, sex, race, bmi, ECOG}
+
+Conditioning on Z aims to block confounding pathways between treatment and outcome. Under the assumptions of conditional exchangeability, positivity, and consistency, the ATT can be identified from the observed data using weighting or outcome regression methods.
+
+```{r}
+#| label: fig-dag-structure
+#| fig-cap: "DAG structure"
+
+dag <- dagitty(
+  "
+dag {
+
+  treat_drug [pos=\"0,0\"]
+  cr_pr_4m [pos=\"3,0\"]
+
+  age [pos=\"1,1\"]
+  sex [pos=\"1,-1\"]
+  race [pos=\"2,1\"]
+  bmi [pos=\"2,-1\"]
+  ECOG [pos=\"3,-1\"]
+
+  treat_drug -> cr_pr_4m
+
+  age -> cr_pr_4m
+  age -> treat_drug
+  sex -> cr_pr_4m
+  sex -> treat_drug
+  race -> cr_pr_4m
+  race -> treat_drug
+  bmi -> cr_pr_4m
+  bmi -> treat_drug
+  ECOG -> cr_pr_4m
+  ECOG -> treat_drug
+}
+"
+)
+
+ggdag(dag, text = FALSE, use_labels = "name") +
+  theme_dag()
+```
+
+Identification of the ATT relies on the following assumptions:
+
+- **Conditional exchangeability**: conditional on age, sex, and education, treatment assignment is independent of the potential outcomes.
+- **Positivity**: for all covariate values Z, individuals have a non-zero probability of both receiving and not receiving treatment.
+- **Consistency**: the observed outcome corresponds to the potential outcome under the treatment actually received.
+
+# Naive Association
+
+```{r}
+#| label: fig-distribution-groups-aza-group
+#| fig-cap: "Density plot of change in cr+pr by 4 months for for treated (new drug) and control (standard treatment) patients"
+
+df_all %>%
+  ggplot(aes(cr_pr_4m, fill = factor(treat_drug))) +
+  geom_vline(xintercept = 0, color = "grey60", linewidth = 1) +
+  geom_density(color = "white", alpha = .75, linewidth = .5) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(
+    x = "CR+PR by 4 months"
+  )
+```
+
+```{r}
+#| label: distribution-groups-summary-crude
+
+df_all %>%
+  group_by(treat_drug) %>% # without differenciating sources
+  summarize(
+    mean_cr_pr_4m = mean(cr_pr_4m),
+    sd = sd(cr_pr_4m),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+This contrast represents an unadjusted association and may be confounded: the mean difference in CR + PR by 4 months may suggest an association with YES treatment. These results are the same as having a simple linear regression (below).
+
+## Naive OLS
+
+Model with open backdoors (see Z), risking biased for ATT estimation (unless randomized), by assuming that NO groups are the same and not matching/weigthening is needed.
+
+```{r}
+#| label: naive-lm-ivo-aza
+
+# Fit naive OLS
+naive_ml <- lm(cr_pr_4m ~ treat_drug, data = df_all)
+naive_ml
+
+# Mean for qsmk=0 → 0.2059
+# Mean for qsmk=1 → 0.2059 + 0.3879 = 0.594
+```
+
+# Outcome OLS - Multi-covariate adjustment
+
+If Z blocks backdoors and model is correct, the βA targets ATT.
+
+These models are sensitive to misspecification, omitted interactions or nonlinearity.
+```{r}
+#| label: outcome-lm-ivo-aza
+
+# g-formula via regression
+outcome_ml <- lm(
+  cr_pr_4m ~ treat_drug + sex + age + race + bmi + ECOG,
+  data = df_all
+)
+
+outcome_ml
+```
+
+# Propensity Score Methods (PSM)
+
+We estimate the propensity score (PS):
+
+Pr(A = 1 \| Z) = Pr(qsmk = 1 \| age, sex, education)
+
+```{r}
+#| label: analysis-dataset-att-hca
+
+# Dataset for external-control alignment:
+# treated = trial YES
+# control = external RWD NO
+
+df_ps <- df_all %>%
+  filter(
+    (source == "trial" & treat_drug == "YES") |
+      (source == "rwd" & treat_drug == "NO")
+  )
+```
+
+```{r}
+#| label: ps-model
+
+ps_model <- glm(
+  treat_drug ~ age + sex + race + bmi + ECOG,
+  data = df_ps,
+  family = binomial()
+)
+
+df_ps$ps <- predict(ps_model, type = "response")
+```
+
+```{r}
+#| label: beseline-imbalance
+
+# Aim for |SMD| < 0.1 after adjustment
+bal <- bal.tab(
+  treat_drug ~ age + sex + race + bmi + ECOG,
+  data = df_ps,
+  estimand = "ATT",
+  un = TRUE # show unadjusted differences
+)
+
+bal
+```
+
+```{r}
+#| label: fig-beseline-imbalance
+#| fig-cap: "PS baseline imbalance - Raw PS overlap (before any method)"
+
+# Raw PS overlap (before any method)
+ggplot(
+  df_ps,
+  aes(x = ps, fill = factor(treat_drug), color = factor(treat_drug))
+) +
+  geom_density(alpha = .4, linewidth = 1) +
+  labs(
+    x = "Propensity score",
+    y = "Density",
+    fill = "A",
+    color = "A"
+  ) +
+  theme_minimal()
+```
+
+## Inverse Probability Weighting and Balancing
+
+Create a “pseudo-population” where the distribution of measured baseline covariates is almost perfectly balanced. Every patient is assigned with a weight equal to the inverse of the probability of receiving the treatment that actually received.
+
+### IPTW-ATT Stabilized weights
+
+Stabilized weights are often preferred because of its variance control, not bias correction.
+
+*Note: same final results can be obtained using WeightIt package.*
+
+```{r}
+#| label: IPTW-att-weights
+
+df_att <- df_ps %>%
+  mutate(
+    w_att = ifelse(
+      treat_drug == "YES",
+      1,
+      ps / (1 - ps)
+    )
+  )
+```
+
+```{r}
+#| label: hybrid-arm-stabilized-att
+
+#' The IPTW-ATT weights received by the external control arm subjects will
+#' be multiplied by (1−1/r) to accurately refect the contribution of the ECA in the HCA.
+#' Majumdar et al 2022. Their goal is to have a 1:1 ratio between Tx and Pbo.
+r <- 32 / 16 # or more generally n_treated (32) / n_internal_control (16) = 2
+
+# Extract external NO weights from the external-control alignment step
+ext_aza_att <- df_att %>%
+  filter(source == "rwd") %>%
+  dplyr::select(patient_id, w_att)
+
+# Re-join weighted external NO with internal trial controls
+df_hybrid_att <- df_all %>%
+  left_join(ext_aza_att, by = "patient_id") %>%
+  mutate(
+    hybrid_w = case_when(
+      source == "trial" & treat_drug == "YES" ~ 1,
+      source == "trial" & treat_drug == "NO" ~ 1,
+      source == "rwd" & treat_drug == "NO" ~ (1 - 1 / r) * w_att
+    )
+  )
+```
+
+```{r}
+#| label: fig-hybrid-weights-stabilized
+#| fig-cap: "Distribution of weights in the stabilized hybrid control analysis"
+
+ggplot(df_hybrid_att, aes(hybrid_w)) +
+  geom_histogram(color = "white", fill = "#E69F00", bins = 40) +
+  scale_x_log10() +
+  theme_minimal(base_size = 14) +
+  xlab("Hybrid analysis weights")
+```
+
+```{r}
+#| label: balance-att-stabilized
+
+bal_att <- bal.tab(
+  treat_drug ~ age + sex + race + bmi + ECOG,
+  data = df_att,
+  weights = df_att$w_att,
+  estimand = "ATT",
+  un = TRUE
+)
+
+bal_att
+```
+
+```{r}
+#| label: fig-love-plot-att-stabilized
+#| fig-cap: "Covariate balance after stabilized ATT weighting"
+
+love.plot(
+  bal_att,
+  binary = "std",
+  stats = "mean.diffs",
+  stars = "std"
+)
+```
+
+#### Causal effect estimation with IPTW
+
+In lm weighted regression the point estimate is correct, but the variance may be underestimated when weights represent sampling or IPW weights.
+
+Thus after this the variance should be corrected, for example with robust SE approach or bootstrap.
+
+##### Weigthed regression without correction
+
+```{r}
+#| label: hybrid-effect-stabilized-att-rd
+
+# outcome analysis
+hybrid_fit_att <- lm(
+  cr_pr_4m ~ treat_drug,
+  data = df_hybrid_att,
+  weights = hybrid_w
+)
+
+summary(hybrid_fit_att)
+```
+
+##### Weigthed regression with robust SEs
+
+```{r}
+#| label: hybrid-effect-stabilized-att-robust
+
+hybrid_fit_att_robust <- coeftest(
+  hybrid_fit_att,
+  vcov = vcovHC(hybrid_fit_att, type = "HC0")
+)
+
+hybrid_att_results <- hybrid_fit_att_robust %>%
+  tidy(conf.int = TRUE) %>%
+  filter(term == "treat_drugYES")
+
+hybrid_att_results
+```
+
+#### Weigthed regression with bootstrap confidence intervals 
+
+```{r}
+#| label: bootstap-se-correction-hybrid-with-rsample
+
+fit_hybrid_ipw <- function(.split, ...) {
+  # bootstrap sample from the full dataset
+  .df <- as.data.frame(.split) %>%
+    mutate(row_id_boot = row_number())
+
+  # -----------------------------
+  # Stage 1: external-control alignment
+  # treated = trial YES
+  # control = external RWD NO
+  # -----------------------------
+  .df_ps <- .df %>%
+    filter(
+      (source == "trial" & treat_drug == "YES") |
+        (source == "rwd" & treat_drug == "NO")
+    )
+
+  # fit PS model in bootstrap sample
+  propensity_model <- glm(
+    treat_drug ~ sex + age + race + bmi + ECOG,
+    family = binomial(),
+    data = .df_ps
+  )
+
+  # predicted PS for P(YES | Z)
+  .df_ps <- propensity_model %>%
+    augment(type.predict = "response", data = .df_ps) %>%
+    mutate(
+      w_att = ifelse(
+        treat_drug == "YES",
+        1,
+        .fitted / (1 - .fitted)
+      )
+    )
+
+  # keep only external NO weights to re-join later
+  ext_weights <- .df_ps %>%
+    filter(source == "rwd", treat_drug == "NO") %>%
+    dplyr::select(row_id_boot, w_att)
+
+  # -----------------------------
+  # Stage 2: reconstruct hybrid NO arm
+  # -----------------------------
+  r <- 32 / 16
+
+  .df_hybrid <- .df %>%
+    left_join(ext_weights, by = "row_id_boot") %>%
+    mutate(
+      hybrid_w = case_when(
+        source == "trial" & treat_drug == "YES" ~ 1,
+        source == "trial" & treat_drug == "NO" ~ 1,
+        source == "rwd" & treat_drug == "NO" ~ w_att * (1 - 1 / r)
+      )
+    )
+
+  # final weighted hybrid model
+  lm(cr_pr_4m ~ treat_drug, data = .df_hybrid, weights = hybrid_w) %>%
+    tidy()
+}
+
+hybrid_results_boot <- bootstraps(df_all, times = 500, apparent = TRUE) %>%
+  mutate(results = map(splits, fit_hybrid_ipw))
+
+boot_estimate_hybrid <- int_t(hybrid_results_boot, results) %>%
+  filter(term == "treat_drugYES")
+
+boot_estimate_hybrid
+```
+
+For patients similar to those treated with YES in the trial, the probability of response (CR+PR) at 4 months is estimated to be about 51 (CI95% 0.36-0.71) percentage points higher under YES than under NO (using the doubly robust AIPW estimator), using the doubly robust AIPW estimator.
+
+# Sensitivity analysis with balancing weight methods
+## Calibration weighting
+
+Unlike propensity score approaches that first estimate the probability of treatment assignment and then derive weights from that model, calibration weighting directly constructs weights so that the weighted covariate distribution is balanced between treatment groups.
+
+In practice it can be attractive because the balance is guaranteed for specified moments, fewer extreme weights than IPTW and there is less reliance on correctly specifying a treatment model.
+
+```{r}
+#| label: calibration-weighting-method-hybrid
+
+# ------------------------------------------------------------
+# Hybrid Control Arm with calibration weighting
+# Stage 1: estimate entropy-balancing weights on
+#          trial YES vs external RWD NO
+# Stage 2: re-join weighted external NO with internal trial NO
+# ------------------------------------------------------------
+
+# Stage 1: external-control alignment dataset
+df_ps <- df_all %>%
+  filter(
+    (source == "trial" & treat_drug == "YES") |
+      (source == "rwd" & treat_drug == "NO")
+  )
+
+# Entropy balancing on external-control alignment set
+calib_weights <- weightit(
+  treat_drug ~ age + sex,
+  data = df_ps,
+  focal = "YES",
+  method = "ebal",
+  estimand = "ATT"
+)
+
+# Extract calibration weights
+df_ps <- df_ps %>%
+  mutate(
+    w_cal = get.w(calib_weights)
+  )
+
+# Optional balance diagnostics
+bal.tab(
+  calib_weights,
+  estimand = "ATT",
+  un = TRUE
+)
+
+# Keep external NO calibration weights only
+ext_aza_cal <- df_ps %>%
+  filter(source == "rwd", treat_drug == "NO") %>%
+  dplyr::select(patient_id, w_cal)
+
+# Stage 2: construct hybrid dataset
+df_hybrid_cal <- df_all %>%
+  filter(
+    (source == "trial" & treat_drug == "YES") |
+      (source == "trial" & treat_drug == "NO") |
+      (source == "rwd" & treat_drug == "NO")
+  ) %>%
+  left_join(ext_aza_cal, by = "patient_id") %>%
+  mutate(
+    hybrid_w = case_when(
+      source == "trial" & treat_drug == "YES" ~ 1,
+      source == "trial" & treat_drug == "NO" ~ 1,
+      source == "rwd" & treat_drug == "NO" ~ w_cal
+    )
+  )
+
+# Final hybrid weighted outcome model
+cal_model_hybrid <- lm(
+  cr_pr_4m ~ treat_drug,
+  data = df_hybrid_cal,
+  weights = hybrid_w
+)
+
+# Robust SEs
+cal_model_hybrid_robust <- coeftest(
+  cal_model_hybrid,
+  vcov = vcovHC(cal_model_hybrid, type = "HC0")
+)
+
+# Tidy results for plotting
+cal_estimate_robust_hybrid <- cal_model_hybrid_robust %>%
+  tidy(conf.int = TRUE) %>%
+  filter(term == "treat_drugYES")
+
+cal_estimate_robust_hybrid
+```
+
+After reweighting the external NO patients so their covariate distribution matches the trial YES patients, the probability of achieving CR+PR at 4 months is estimated to be 44.7 (CI95% 0.240 – 0.65) percentage points higher under the new treatment than under the standard care.
+
+# Comparison of methods
+
+```{r}
+#| label: plotting-main-point-estimate-ci
+#| fig-cap: "Estimated ATT (ATO for overlap weightening) for different methods"
+bind_rows(
+  # naive OLS estimates
+  naive_ml %>%
+    tidy(conf.int = TRUE) %>%
+    filter(term == "treat_drugYES") %>%
+    dplyr::select(estimate, conf.low, conf.high) %>%
+    mutate(type = "Naive"),
+
+  # outcome model estimates
+  outcome_ml %>%
+    tidy(conf.int = TRUE) %>%
+    filter(term == "treat_drugYES") %>%
+    dplyr::select(estimate, conf.low, conf.high) %>%
+    mutate(type = "Outcome regression"),
+
+  # hybrid ATT IPW estimates
+  hybrid_att_results %>%
+    dplyr::select(estimate, conf.low, conf.high) %>%
+    mutate(type = "Hybrid IPW robust"),
+
+  # bootstrap estimates for the hybrid ATT IPW analysis
+  boot_estimate_hybrid %>%
+    dplyr::select(
+      estimate = .estimate,
+      conf.low = .lower,
+      conf.high = .upper
+    ) %>%
+    mutate(type = "Hybrid IPW bootstrap"),
+
+  # hybrid calibration weighting estimates
+  cal_estimate_robust_hybrid %>%
+    dplyr::select(estimate, conf.low, conf.high) %>%
+    mutate(type = "Hybrid calibration")
+) %>%
+  arrange() %>%
+  mutate(type = forcats::fct_inorder(type)) %>%
+  ggplot(aes(x = type, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointrange(color = "#0172B1", size = 1, fatten = 3) +
+  coord_flip() +
+  theme_minimal() +
+  theme(axis.title.y = element_blank()) +
+  labs(
+    x = NULL,
+    y = "Risk difference for CR+PR at 4 months (YES - hybrid NO)"
+  )
+```
+
+# Sensitivity analysis for unmeasured confounding 
+
+```{r}
+#| label: e-value-risk-difference
+
+# https://louisahsmith.github.io/evalue/reference/evalues.RD.html
+n11_w <- with(
+  df_hybrid_att,
+  sum(hybrid_w * (treat_drug == "YES") * (cr_pr_4m == 1))
+)
+n10_w <- with(
+  df_hybrid_att,
+  sum(hybrid_w * (treat_drug == "YES") * (cr_pr_4m == 0))
+)
+n01_w <- with(
+  df_hybrid_att,
+  sum(hybrid_w * (treat_drug == "NO") * (cr_pr_4m == 1))
+)
+n00_w <- with(
+  df_hybrid_att,
+  sum(hybrid_w * (treat_drug == "NO") * (cr_pr_4m == 0))
+)
+
+#' Returns E-values for the point estimate and the lower confidence interval limit
+#' for a positive risk difference. If the risk difference is negative, the exposure
+#'  coding should be first be reversed to yield a positive risk difference.
+EValue::evalues.RD(n11_w, n10_w, n01_w, n00_w)
+
+# for tipping point analysis, tipr package does not have calculation for RD measures.
+```
