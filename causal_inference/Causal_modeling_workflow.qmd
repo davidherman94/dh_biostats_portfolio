@@ -1,0 +1,946 @@
+---
+title: "Causal Modeling Workflow – NHEFS Example" 
+author: "David Herman"    
+date: today                                         
+format:
+  # ↓ html file
+  html:
+    embed-resources: true  # Embed CSS, JS, and images into the HTML file
+    toc: true              # Include a table of contents
+    toc-depth: 4           # Show headings up to level 4 in the TOC
+    toc-location: right    # Place TOC on the right side
+    number-sections: true  # Automatically number section headings
+    code-fold: false       # Do not collapse code blocks by default
+editor: source      
+execute:
+  echo: true                # Display R code in the reports as default
+  warning: false            # Suppress warnings in the output
+  message: false            # Suppress messages in the output
+  error: true               # Stop rendering if an error occurs                                            
+---
+
+# Objective
+
+This document reproduces the original training example using the same dataset (NHEFS from the `causaldata` package) from Malcolm Barrett (2026). Moreover, it was addded extra PS matching approaches as suggested by Julien Tanniou (Saryga, 2025).
+
+_Illustrative research question: Do individuals who quit smoking gain weight?_
+
+# Data source
+
+We use the [`nhefs_complete`](https://wwwn.cdc.gov/nchs/nhanes/nhefs/) dataset from the `causaldata` package and restrict to uncensored individuals, as in the training material.
+
+To keep the adjustment strategy transparent, we retain a reduced confounder set compared to the original study:
+
+-   `qsmk`: quit smoking indicator (treatment A)
+-   `wt82_71`: weight change 1971–1982 (outcome Y)
+-   `age`: age in years
+-   `sex`: sex (1 = male)
+-   `education`: education level, from 1 to 5
+
+*Note: the correct approach would be conducting a literature review and having feedback from clinical experts as well as creating the DAGs (see below) and discussing with pharmaco-epidemiolgist. For simplification purpuses, here three baseline covariates were used.*
+
+```{r}
+#| label: load-libraries
+
+library(causaldata) # Provides datasets used in causal inference, including the NHEFS
+library(tidyverse) # Core data science workflow
+library(ggdag) # Visualization tools for directed acyclic graphs (DAGs)
+library(broom) # Converts model objects (e.g., lm, glm) into tidy df.
+library(dagitty) # Formal specification and analysis of causal DAGs
+library(MatchIt) # Implements propensity score matching algorithms
+library(WeightIt) # Implements propensity score weighting and balancing approaches
+library(cobalt) # Covariate balance diagnostics and visualization
+library(ggplot2) # Grammar of graphics plotting system
+library(rsample) # for bootstraps in correcting variance for iptw
+library(glmnet) # LASSO log regression (appendix)
+library(patchwork) # combined plots
+```
+
+```{r}
+#| label: define-data-source
+df <- nhefs_complete %>%
+  filter(censored == 0) %>%
+  dplyr::select(qsmk, wt82_71, age, sex, education)
+```
+
+# Target Estimand and Identification
+
+The objective is to estimate the Average Treatment Effect (ATE) of smoking cessation on weight change (continuous), defined as the mean difference (RD) in potential outcomes:
+
+E\[Y(1)\] − E\[Y(0)\]
+
+where:
+
+-   A = quitting smoking (`qsmk`)
+-   Y = weight change (`wt82_71`)
+
+Because treatment is not randomized, treatment assignment depends on baseline covariates that also affect the outcome, creating confounding. Based on subject-matter knowledge and the causal structure illustrated in @fig-dag-structure, age, sex, and education influence both smoking cessation and weight change.
+
+Under this causal model, the backdoor adjustment set: 
+
+Z = {age, sex, education}
+
+```{r}
+#| label: fig-dag-structure
+#| fig-cap: "DAG structure"
+
+# Age, sex, and education affect both smoking cessation and weight change.
+dag <- dagitty(
+  "
+dag {
+
+  qsmk [pos=\"0,0\"]
+  wt82_71 [pos=\"3,0\"]
+
+  age [pos=\"1,1\"]
+  sex [pos=\"1,-1\"]
+  education [pos=\"2,1\"]
+
+  qsmk -> wt82_71
+
+  age -> qsmk
+  age -> wt82_71
+
+  sex -> qsmk
+  sex -> wt82_71
+
+  education -> qsmk
+  education -> wt82_71
+}
+"
+)
+
+ggdag(dag, text = FALSE, use_labels = "name") +
+  theme_dag()
+```
+
+Identification of the ATE relies on the following assumptions:
+
+- **Conditional exchangeability**: conditional on age, sex, and education, treatment assignment is independent of the potential outcomes.
+- **Positivity**: for all covariate values Z, individuals have a non-zero probability of both receiving and not receiving treatment.
+- **Consistency**: the observed outcome corresponds to the potential outcome under the treatment actually received.
+
+# Naive Association
+
+```{r}
+#| label: fig-distribution-groups
+#| fig-cap: "A density plot of change in weight for those who quit smoking and those who did not"
+
+df %>%
+  ggplot(aes(wt82_71, fill = factor(qsmk))) +
+  geom_vline(xintercept = 0, color = "grey60", linewidth = 1) +
+  geom_density(color = "white", alpha = .75, linewidth = .5) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(
+    x = "change in weight (kg)",
+    fill = "quit smoking (1 = yes)"
+  )
+```
+
+```{r}
+#| label: distribution-groups-summary
+df %>%
+  group_by(qsmk) %>%
+  summarize(
+    mean_weight_change = mean(wt82_71),
+    sd = sd(wt82_71),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+This contrast represents an unadjusted association and may be confounded: \~2.5 KGs gained for quit vs. not quit. The mean difference in weight may suggest an association with quiting smoking. These results are the same as having a simple linear regression.
+
+## Naive OLS
+
+Model with open backdoors via Z1, Z2 and Z3, risking biased for ATE estimation (unless randomized).
+
+```{r}
+#| label: naive-lm
+
+# Fit naive OLS
+naive_ml <- lm(wt82_71 ~ qsmk, data = df)
+naive_ml
+
+# Mean for qsmk=0 → 1.984
+# Mean for qsmk=1 → 1.984 + 2.541 = 4.525
+```
+
+# Outcome OLS - Multi-covariate adjustment
+
+If Z blocks backdoors and model is correct, the βA targets ATE.
+
+These models are sensitive to misspecification, omitted interactions or nonlinearity.
+```{r}
+#| label: outcome-lm
+
+# g-formula via regression
+outcome_ml <- lm(wt82_71 ~ qsmk + sex + age + education, data = df)
+outcome_ml
+```
+
+# Propensity Score Matching (PSM)
+
+**"Counterfactual: what if everyone quit smoking vs. what if no one quit smoking"**
+
+We estimate the propensity score (PS):
+
+Pr(A = 1 \| Z) = Pr(qsmk = 1 \| age, sex, education)
+
+```{r}
+#| label: PS-estimation
+
+ps_model <- glm(
+  qsmk ~ age + sex + education,
+  data = df,
+  family = binomial()
+)
+
+df$ps <- predict(ps_model, type = "response")
+
+# Trim extreme values
+df$ps <- pmin(pmax(df$ps, 0.01), 0.99)
+```
+
+```{r}
+#| label: beseline-imbalance
+
+# Aim for |SMD| < 0.1 after adjustment
+bal <- bal.tab(
+  qsmk ~ age + sex + education,
+  data = df,
+  estimand = "ATE",
+  un = TRUE # show unadjusted differences
+)
+
+bal
+```
+
+```{r}
+#| label: fig-beseline-imbalance
+#| fig-cap: "PS baseline imbalance - Raw PS overlap (before any method)"
+
+# Raw PS overlap (before any method)
+ggplot(df, aes(x = ps, fill = factor(qsmk), color = factor(qsmk))) +
+  geom_density(alpha = 0.25, linewidth = 1) +
+  labs(
+    x = "Propensity score",
+    y = "density",
+    fill = "A",
+    color = "A"
+  ) +
+  theme_minimal()
+```
+
+## Propensity Score Matching
+
+We use the `MatchIt` package for matching estimators.
+
+### Nearest Neighbor Matching 1:1
+
+A distance is computed between the PS of each treated patient and each control patient. Each patient in the treated group is picked at random and matched with the closest one in the control group. The matched dataset has the same number of patients in both arms (non-matched control patients are removed).
+
+```{r}
+m_nn <- matchit(
+  qsmk ~ age + sex + education,
+  data = df,
+  method = "nearest",
+  ratio = 1
+)
+summary(m_nn)
+```
+
+```{r}
+#| label: beseline-imbalance-nearest-neighbor
+
+bal_nn <- bal.tab(
+  m_nn,
+  estimand = "ATE",
+  un = TRUE # show unadjusted + adjusted
+)
+
+bal_nn
+```
+
+```{r}
+#| label: beseline-tte-nn
+
+# After 1:1 nearest neighbor matching, check treatment effect on the matched sample.
+md_nn <- match.data(m_nn)
+
+ate_nn <- lm(
+  wt82_71 ~ qsmk,
+  data = md_nn,
+  weights = weights
+)
+
+summary(ate_nn)
+```
+
+```{r}
+#| label: fig-beseline-imbalance-nearest-neighbor-love-plot
+#| fig-cap: "Covariate balance after nearest neighbor 1:1 matching"
+
+plot_nn_after <- ggplot(
+  md_nn,
+  aes(x = distance, fill = factor(qsmk), color = factor(qsmk))
+) +
+  geom_density(aes(weight = weights), alpha = 0.25, linewidth = 1) +
+  labs(x = "Propensity score", y = "density", fill = "A", color = "A") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+plot_nn <- love.plot(m_nn, binary = "std") +
+  theme(legend.position = "bottom")
+
+### Put PS overlap + Love plot on the same line (patchwork package)
+plot_nn_after + plot_nn + plot_layout(ncol = 2)
+```
+
+### Nearest neighbour matching 1:1 with caliper
+
+Here, the absolute difference in PS between patients in the same pair has to be lower than a specific threshold (the caliper). This can avoid poor matches in low-overlap regions and improves internal validity. The issue is that some patients may remain unmatched and are excluded.
+
+```{r}
+#| label: caliper-tte-nn
+
+m_nn_cal <- matchit(
+  qsmk ~ age + sex + education,
+  data = df,
+  method = "nearest",
+  distance = df$ps,
+  caliper = 0.2,
+  ratio = 1
+)
+
+summary(m_nn_cal)
+```
+
+```{r}
+#| label: beseline-imbalance-nearest-neighbor-caliper
+
+bal_nn_cal <- bal.tab(
+  m_nn_cal,
+  estimand = "ATE",
+  un = TRUE # show unadjusted + adjusted
+)
+
+bal_nn_cal
+```
+
+```{r}
+#| label: beseline-tte-nn-caliper
+
+#' After 1:1 nearest neighbor matching with caliper,
+#' check treatment effect on the matched sample.
+md_nn_cal <- match.data(m_nn_cal)
+
+ate_nn_cal <- lm(
+  wt82_71 ~ qsmk,
+  data = md_nn_cal,
+  weights = weights # equal to 1 as ratio is 1
+)
+
+summary(ate_nn_cal)
+```
+
+```{r}
+#| label: fig-beseline-imbalance-nearest-neighbor-love-plot-caliper
+#| fig-cap: "Covariate balance after nearest neighbor 1:1 matching with caliper"
+
+plot_nn_cal_after <- ggplot(
+  md_nn_cal,
+  aes(x = distance, fill = factor(qsmk), color = factor(qsmk))
+) +
+  geom_density(aes(weight = weights), alpha = 0.25, linewidth = 1) +
+  labs(x = "Propensity score", y = "density", fill = "A", color = "A") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+plot_nn_cal <- love.plot(m_nn_cal, binary = "std") +
+  theme(legend.position = "bottom")
+
+### Put PS overlap + Love plot on the same line (patchwork package)
+plot_nn_cal_after + plot_nn_cal + plot_layout(ncol = 2)
+```
+
+### Optimal Matching
+
+Advantages of optimal pair matching include that the matching order is not required to be specified and it is less likely that extreme within-pair distances will be large, unlike with nearest neighbor matching. Generally, however, as a subset selection method, optimal pair matching tends to perform similarly to nearest neighbor matching in that similar subsets of units will be selected to be matched.
+
+#### Optimal matching 1:1
+Pairs are made in order to limit the overall difference across pairs (optimization model).
+
+```{r}
+#| label: beseline-optimal-match-1-1
+
+# 1:1 optimal PS matching with exact matching on sex
+#' more options can be checked at:
+#'  https://kosukeimai.github.io/MatchIt/index.html
+
+m_opt <- matchit(
+  qsmk ~ age + sex + education,
+  data = df,
+  method = "optimal",
+  exact = ~sex
+)
+
+m_opt
+```
+
+```{r}
+#| label: beseline-tte-optimal-1-1
+
+#' After optimal matching 1:1,
+#' check treatment effect on the matched sample.
+m_opt_df <- match.data(m_opt)
+
+ate_m_opt <- lm(
+  wt82_71 ~ qsmk,
+  data = m_opt_df,
+  weights = weights
+)
+
+summary(ate_m_opt)
+```
+
+#### Optimal matching with fixed ratio (1:M)
+Each patient from the smallest group can be matched with either 1 or many patients of the other group.
+
+```{r}
+#| label: beseline-optimal-match-1m
+# 1:2 matching (each treated matched with up to 2 controls).
+m_opt_1m <- matchit(
+  qsmk ~ age + sex + education,
+  data = df,
+  method = "optimal",
+  ratio = 2
+)
+
+m_opt_1m
+```
+
+```{r}
+#| label: beseline-tte-nn-optimal-1m
+
+#' After optimal matching 1:1,
+#' check treatment effect on the matched sample.
+m_opt_1m_df <- match.data(m_opt_1m)
+
+ate_m_opt_1m <- lm(
+  wt82_71 ~ qsmk,
+  data = m_opt_1m_df,
+  weights = weights
+)
+
+summary(ate_m_opt_1m)
+```
+
+### Variable ratio optimal matching (true 1:M or full matching)
+
+To allow each treated to have different numbers of controls.
+
+```{r}
+#| label: beseline-optimal-match-variable-ratio
+m_var_ratio <- matchit(
+  qsmk ~ age + sex + education,
+  data = df,
+  method = "full"
+)
+```
+
+```{r}
+#| label: beseline-tte-optimal-variable-ratio
+
+#' After optimal varaible ratio,
+#' check treatment effect on the matched sample.
+m_opt_var_ratio <- match.data(m_var_ratio)
+
+ate_m_opt_var_ratio <- lm(
+  wt82_71 ~ qsmk,
+  data = m_opt_var_ratio,
+  weights = weights
+)
+
+summary(ate_m_opt_var_ratio)
+```
+
+## Propensity Score Stratification
+
+### Outcome regression with stratum
+
+Estimate the treatment effect in subsets of patients having similar values of PS, then combine them in an overall treatment effect. The total dataset is divided into mutually exclusive groups (strata), based on the estimated PS. Within the same stratum, the distribution of measured baseline covariates is similar between treated and control patients.
+
+```{r}
+#| label: ps-stratified
+
+# Most common approach: 5 groups, may eliminate ≈ 90% of the bias but strata may include very dissimilar patients.
+df <- df %>%
+  # Partition by PS (e.g., quantiles);
+  mutate(
+    ps_strata = cut(
+      ps,
+      breaks = quantile(ps, probs = seq(0, 1, 0.2)),
+      include.lowest = TRUE,
+      labels = FALSE
+    )
+  )
+
+# Outcome regression with stratum
+lm(wt82_71 ~ qsmk + factor(ps_strata), data = df)
+```
+
+### Propensity Score Stratification (Subclassification ATE)
+
+```{r}
+# 1) Stratum-specific means and mean differences
+tab_strat <- df %>%
+  group_by(ps_strata, qsmk) %>%
+  summarise(
+    mean_y = mean(wt82_71, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = qsmk,
+    values_from = c(mean_y, n),
+    names_sep = "_",
+    values_fill = NA
+  ) %>%
+  mutate(
+    MD = mean_y_1 - mean_y_0, # stratum-specific mean difference
+    n_stratum = n_0 + n_1 # stratum size
+  )
+
+# 3) Subclassification ATE = weighted average of stratum-specific MDs (weights = stratum size)
+ATE_subclass <- with(
+  tab_strat,
+  sum((n_stratum / sum(n_stratum, na.rm = TRUE)) * MD, na.rm = TRUE)
+)
+
+cat("\n=== PS subclassification (quintiles) – ATE (mean difference) ===\n")
+print(ATE_subclass)
+
+cat("\nStratum-specific table:\n")
+print(tab_strat %>% arrange(ps_strata))
+```
+
+Stratification estimates a weighted average of within-stratum effects.
+
+## Propensity Score as covariate (linear)
+
+Include PS as continuous covariate in outcome regression. Raises the question of the relationship between the PS and the outcome. Even though is simpler and include all subjects, potential bias may arise if functional form is misspecified. Moreover, is difficult to assess if PS worked
+
+```{r}
+## PS as covariate (linear)
+fit_ps_lin <- lm(wt82_71 ~ qsmk + ps, data = df)
+
+fit_ps_lin %>%
+  tidy(conf.int = TRUE) %>%
+  filter(term == "qsmk")
+```
+
+## Inverse Probability Weighting and Balancing
+
+Create a “pseudo-population” where the distribution of measured baseline covariates is almost perfectly balanced. Every patient is assigned with a weight equal to the inverse of the probability of receiving the treatment that actually received.
+
+### General IPTW (unstablized)
+
+*Note: May be inaccurate or unstable for patients with very low or very high PS.*
+
+```{r}
+#| label: ipw-manual-weights-unstablized
+
+df <- df %>%
+  mutate(
+    w_uiptw = ifelse(qsmk == 1, 1 / ps, 1 / (1 - ps))
+  )
+```
+
+```{r}
+#| label: fig-model-assumptions-unstabilized
+#| fig-cap: "Distribution of unstabilized weights"
+
+ggplot(df, aes(w_uiptw)) +
+  geom_histogram(color = "white", fill = "#E69F00", bins = 50) +
+  #  use a log scale for the x axis
+  scale_x_log10() +
+  theme_minimal(base_size = 20) +
+  xlab("Weights")
+```
+
+```{r}
+ate_iptw <- lm(wt82_71 ~ qsmk, data = df, weights = w_uiptw)
+summary(ate_iptw)
+```
+
+```{r}
+# Balance diagnostics (unstabilized IPTW)
+bal_iptw <- bal.tab(
+  qsmk ~ age + sex + education,
+  data = df,
+  weights = df$w_uiptw,
+  estimand = "ATE",
+  un = TRUE
+)
+bal_iptw
+```
+
+```{r}
+#| label: fig-iptw-manual-weights-unstablized-love-plot
+#| fig-cap: "Covariate balance after unstabilized IPTW"
+
+love.plot(bal_iptw, binary = "std")
+```
+
+### IPTW Stabilized weights
+
+Stabilized weights are often preferred because of its variance control, not bias correction.
+
+*Note: same final results can be obtained using WeightIt package.*
+
+```{r}
+#| label: stabilized-ipw-weights
+
+pA <- mean(df$qsmk)
+
+df <- df %>%
+  mutate(
+    # calculate the stabilized weights
+    w_siptw = ifelse(qsmk == 1, pA / ps, (1 - pA) / (1 - ps))
+  )
+
+# an alternative approach with same results by using propensity package
+library(propensity)
+df <- ps_model %>%
+  # predict whether quit smoking
+  augment(type.predict = "response", data = df) %>%
+  # calculate inverse probability
+  mutate(wts_st = wt_ate(.fitted, qsmk, stabilize = TRUE)) # default ustabilize
+```
+
+```{r}
+#| label: fig-model-assumptions
+#| fig-cap: "Distribution of stabilized weights"
+
+ggplot(df, aes(w_siptw)) +
+  geom_histogram(color = "white", fill = "#E69F00", bins = 50) +
+  #  use a log scale for the x axis
+  scale_x_log10() +
+  theme_minimal(base_size = 20) +
+  xlab("Weights")
+```
+
+```{r}
+#| label: balance-stabilized-ipw-weights
+
+# Balance diagnostics (stabilized IPTW)
+bal_siptw <- bal.tab(
+  qsmk ~ age + sex + education,
+  data = df,
+  weights = df$w_siptw,
+  method = "weighting",
+  estimand = "ATE",
+  un = TRUE
+)
+
+bal_siptw
+```
+
+```{r}
+#| label: fig-observed-smd-confounders-ipw-stabilized
+#| fig-cap: "SMD osberved vs wts method"
+
+# Note: tutorial
+
+vars <- c("sex", "age", "education")
+
+library(halfmoon)
+plot_df <- df %>%
+  tidy_smd(all_of(vars), .group = qsmk, .wts = w_siptw)
+
+ggplot(
+  data = plot_df,
+  aes(x = abs(smd), y = variable, group = method, color = method, fill = method)
+) +
+  geom_line(orientation = "y", size = 1) +
+  geom_point(size = 4, color = "white", shape = 21) +
+  geom_vline(xintercept = 0.1, color = "black", linewidth = 0.3) +
+  theme_minimal(base_size = 20) +
+  theme(axis.title.y = element_blank()) +
+  scale_color_manual(values = c("grey85", "#00BFC4")) +
+  scale_fill_manual(values = c("grey85", "#00BFC4")) +
+  xlim(0, .3)
+```
+
+#### Causal effect estimation with IPW
+
+In lm weighted regression the point estimate is correct, but the variance may be underestimated when weights represent sampling or IPW weights.
+
+Thus after this the variance should be corrected, for example with robust SE approach or bootstrap.
+
+##### Weigthed regression wthout correction
+
+```{r}
+#| label: ipw-stabilized-model
+
+# Estimate causal effect with IPW
+# fit lm mdoel with weights
+ate_siptw <- lm(wt82_71 ~ qsmk, data = df, weights = w_siptw)
+
+sipw_estimate <- ate_siptw %>%
+  tidy(conf.int = TRUE) %>%
+  filter(term == "qsmk")
+
+# naive-incorrect-CI
+sipw_estimate
+```
+
+##### 5.3.1.1.2 Weigthed regression with robust SEs (coeftest)
+
+```{r}
+# Correcting variance
+# Note: there are pks for this, such as robustbase, gee, estimatr, etc.
+library(sandwich)
+library(lmtest)
+
+# fix CI with robust SEs
+ipw_model_robust <- coeftest(
+  ate_siptw,
+  vcov = vcovHC(ate_siptw, type = "HC0")
+)
+
+ipw_estimate_robust <- ipw_model_robust %>%
+  tidy(conf.int = TRUE) %>%
+  filter(term == "qsmk")
+
+ipw_estimate_robust
+```
+
+##### Weigthed regression with robust SEs with survey package
+
+Designed for sampling weights and causal weights and uses robust (sandwich) variance estimators. This approach is more recommended for IPW workflow.
+
+```{r}
+#| label: survey-ipw-stabilized-model-SE
+
+library(survey)
+
+des_ipw <- svydesign(ids = ~1, weights = ~w_siptw, data = df)
+fit_ipw_svy <- svyglm(wt82_71 ~ qsmk, design = des_ipw, family = gaussian())
+
+
+fit_ipw_svy_estimated <- fit_ipw_svy %>%
+  tidy(conf.int = TRUE) %>%
+  filter(term == "qsmk")
+
+fit_ipw_svy_estimated
+```
+
+#### Weigthed regression with bootstrap confidence intervals with rsample
+
+```{r}
+#| label: bootstap-se-correction
+
+# following example from: https://github.com/r-causal/causal_inference_r_workshop/blob/master/slides/raw/01-causal_modeling_whole_game.qmd
+fit_ipw <- function(.split, ...) {
+  # get bootstrapped data frame
+  .df <- as.data.frame(.split)
+
+  # fit propensity score model
+  propensity_model <- glm(
+    qsmk ~ sex + age + education,
+    family = binomial(),
+    data = .df
+  )
+
+  # calculate inverse probability weights
+  .df <- propensity_model %>%
+    augment(type.predict = "response", data = .df) %>%
+    mutate(wts = wt_ate(.fitted, qsmk))
+
+  # fit correctly bootstrapped ipw model
+  lm(wt82_71 ~ qsmk, data = .df, weights = wts) %>%
+    tidy()
+}
+
+# fit ipw model to bootstrapped samples (rsample pkg)
+ipw_results <- bootstraps(df, 500, apparent = TRUE) %>%
+  mutate(results = map(splits, fit_ipw))
+
+# get t-statistic-based CIs
+boot_estimate <- int_t(ipw_results, results) %>%
+  filter(term == "qsmk")
+
+boot_estimate
+```
+
+```{r}
+#| echo: false
+bind_rows(
+  ipw_estimate_robust %>%
+    select(estimate, conf.low, conf.high) %>%
+    mutate(type = "ols"),
+  fit_ipw_svy_estimated %>%
+    select(estimate, conf.low, conf.high) %>%
+    mutate(type = "robust"),
+  boot_estimate %>%
+    select(estimate = .estimate, conf.low = .lower, conf.high = .upper) %>%
+    mutate(type = "bootstrap")
+) %>%
+  #  calculate CI width to sort by it
+  mutate(width = conf.high - conf.low) %>%
+  arrange(width) %>%
+  #  fix the order of the model types for the plot
+  mutate(type = fct_inorder(type)) %>%
+  ggplot(aes(x = type, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointrange(color = "#0172B1", size = 1, fatten = 3) +
+  coord_flip() +
+  theme_minimal(base_size = 20) +
+  theme(axis.title.y = element_blank())
+```
+
+Final point estimate and CI95% are similar between 3 approaches: the causal effect estimate is 3.1 kg (95% CI 2.2 kg, 4.1 kg)
+
+# Double robust estimation method (AIPW)
+
+Outcome regression can fail if the outcome model is misspecified and IPTW can fail if the PS model is misspecified or weights are unstable. Thus, methods combine both ideas so that if either the PS model or the outcome model is correct, the effect estimate is still consistent (if both are badly wrong, DR will also be wrong).
+
+```{r}
+# 1) Outcome regression models
+# a. Estimate the outcome model among treated individuals (A = 1).
+# This models E[Y | A = 1, Z], where Z = {age, sex, education}.
+m1_model <- lm(
+  wt82_71 ~ age + sex + education,
+  data = df %>% filter(qsmk == 1)
+)
+
+# b. Estimate the outcome model among untreated individuals (A = 0).
+# This models E[Y | A = 0, Z].
+m0_model <- lm(
+  wt82_71 ~ age + sex + education,
+  data = df %>% filter(qsmk == 0)
+)
+
+# c. Predict potential outcomes
+df$m1_hat <- predict(m1_model, newdata = df)
+df$m0_hat <- predict(m0_model, newdata = df)
+
+# 2) AIPW influence function
+df$aipw_ic <-
+  (df$m1_hat - df$m0_hat) +
+  df$qsmk / df$ps * (df$wt82_71 - df$m1_hat) -
+  (1 - df$qsmk) / (1 - df$ps) * (df$wt82_71 - df$m0_hat)
+
+# 3) Estimate ATE
+N <- nrow(df)
+aipw_est <- mean(df$aipw_ic)
+aipw_se <- sd(df$aipw_ic) / sqrt(N) # influence-function SE
+aipw_ci <- c(
+  aipw_est - 1.96 * aipw_se,
+  aipw_est + 1.96 * aipw_se
+)
+
+aipw_est
+aipw_ci
+```
+
+# Balancing weight methods
+## Calibration weighting
+
+Unlike propensity score approaches that first estimate the probability of treatment assignment and then derive weights from that model, calibration weighting directly constructs weights so that the weighted covariate distribution is balanced between treatment groups.
+
+In practice it can be attractive because the balance is guaranteed for specified moments, fewer extreme weights than IPTW and there is less reliance on correctly specifying a treatment model.
+
+```{r}
+# qsmk = treatment indicator (1 = quit smoking, 0 = did not quit)
+
+# Step 1: Estimate balancing weights
+# weightit() computes weights so that covariate distributions are balanced
+# between treated and control groups.
+
+W <- weightit(
+  qsmk ~ age + sex + education,   # covariates to balance across groups
+  data = df,
+  method = "ebal",                # entropy balancing
+  # ebal solves an optimization problem that finds weights satisfying
+  # moment balance constraints (e.g., equal covariate means across groups), 1st moment
+  estimand = "ATE"                # target estimand: Average Treatment Effect
+)
+
+# Step 2: Extract the estimated weights
+# These weights create a pseudo-population where covariates are balanced.
+
+df$w_cal <- get.w(W)
+
+# Step 3: Assess covariate balance before and after weighting
+# bal.tab() reports standardized mean differences and other diagnostics.
+
+bal.tab(W, un = TRUE)
+
+# Step 4: Estimate the causal effect using a weighted outcome model
+# The weights are incorporated in a regression model estimating the ATE.
+
+cal_model <- lm(wt82_71 ~ qsmk, data = df, weights = w_cal)
+
+# Step 5: Use robust (heteroskedasticity-consistent) standard errors
+# This accounts for the use of estimated weights.
+
+cal_model_robust <- coeftest(
+  cal_model,
+  vcov = vcovHC(cal_model, type = "HC0")
+)
+
+# Step 6: Extract the estimated treatment effect and confidence interval
+
+cal_estimate_robust <- cal_model_robust %>%
+  tidy(conf.int = TRUE) %>%
+  filter(term == "qsmk")
+
+cal_estimate_robust
+```
+
+# Appendix
+
+## LASSO logistic regression in PS estimation
+
+When the number of covariates is large, estimating the propensity score with standard logistic regression can lead to unstable estimates and overfitting.
+
+Penalized methods such as LASSO logistic regression introduce regularization that shrinks coefficients toward zero and can automatically exclude weak predictors. This can improve stability and predictive performance of the propensity score model, particularly in high-dimensional settings common in real-world data. Penalty levels should be chosen carefully (cross-validation, stability, sensitivity).
+
+```{r}
+# Prepare the design matrix
+X <- model.matrix(
+  qsmk ~ age + sex + education,
+  data = df
+)[, -1] # remove intercept
+
+# Fit the LASSO model
+# Select optimal penalty via cross-validation
+cv_lasso <- cv.glmnet(
+  X,
+  df$qsmk,
+  family = "binomial",
+  alpha = 1
+)
+
+# Extract coefficients at the optimal λ
+lasso_coef <- coef(cv_lasso, s = "lambda.min") # or lambda.1se (more regularized model)
+
+# Extract coefficients and compare with ps_model
+comp_table_lasso <- cbind(
+  log_reg_ps = coef(ps_model),
+  lasso_reg = as.vector(lasso_coef)
+)
+
+comp_table_lasso
+```
+
+Most coefficients are smaller in magnitude in the LASSO model compared with the standard logistic regression. For example, education has levels with a coefficient 0, meaning that LASSO considers these predictors not important for predicting treatment assignment.
+
+## Instrumental Variables (IV)
+
+Propensity score methods rely on the assumption that all confounders are observed. If important confounders are unmeasured, these approaches can remain biased.
+
+Instrumental variable methods provide an alternative identification strategy by using a variable that influences treatment assignment but affects the outcome only through treatment. Under certain assumptions, this creates as-if randomized variation in treatment that allows estimation of a causal effect even in the presence of unmeasured confounding.
